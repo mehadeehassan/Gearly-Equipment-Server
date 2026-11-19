@@ -241,6 +241,35 @@ app.delete("/api/favorites/:equipmentId", verifyToken, verifyRenter, async (req,
 });
 
 // Booking creation checks dates, quantities and calculates the amount on the server.
+// Booking creation checks dates, quantities and calculates the amount on the server.
+app.post("/api/bookings", verifyToken, verifyRenter, async (req, res) => {
+  const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } = req.body;
+  if (!validId(equipmentId) || !startDate || !endDate || !contactNumber || !deliveryAddress) {
+    return res.status(400).send({ message: "Missing booking information" });
+  }
+  const start = new Date(startDate), end = new Date(endDate), now = new Date();
+  const requestedQuantity = Number(quantity);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start < new Date(now.toDateString()) || end <= start || !Number.isInteger(requestedQuantity) || requestedQuantity < 1) {
+    return res.status(400).send({ message: "Invalid rental dates or quantity" });
+  }
+  try {
+    const equipment = await equipmentCollection.findOne({ _id: toObjectId(equipmentId), status: "approved" });
+    if (!equipment) return res.status(404).send({ message: "Equipment not found" });
+    if (Number(equipment.availableQuantity || 0) < requestedQuantity) return res.status(409).send({ message: "Requested quantity is not available" });
+    const duration = Math.ceil((end - start) / 86400000);
+    const multiplier = equipment.rentalType === "Weekly" ? Math.ceil(duration / 7) : equipment.rentalType === "Monthly" ? Math.ceil(duration / 30) : duration;
+    const totalAmount = Number(equipment.price) * multiplier * requestedQuantity;
+    const booking = {
+      equipmentId: equipment._id, equipmentTitle: equipment.title, ownerId: equipment.ownerId,
+      customerId: toObjectId(req.user.id), customerName: req.user.name || "", startDate: start, endDate: end,
+      bookingDate: new Date(), duration, quantity: requestedQuantity, contactNumber, deliveryAddress, notes: notes || "",
+      totalAmount, paymentStatus: "pending", bookingStatus: "pending_payment", createdAt: new Date()
+    };
+    const result = await bookingsCollection.insertOne(booking);
+    res.status(201).send({ message: "Booking created", bookingId: result.insertedId, totalAmount });
+  } catch { res.status(500).send({ message: "Failed to create booking" }); }
+});
+
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
