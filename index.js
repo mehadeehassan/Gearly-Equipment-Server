@@ -140,184 +140,179 @@ export function isTestStripeSecretKey(secretKey) {
   return typeof secretKey === 'string' && /^(sk|rk)_test_/.test(secretKey);
 }
 
-export async function verifyCheckoutSession(req, res, {
-  stripe,
-  stripeSecretKey,
-  bookingsCollection,
-  paymentsCollection,
-}) {
-    if (!stripe || !isTestStripeSecretKey(stripeSecretKey)) {
-      return res.status(503).send({ message: 'Stripe Test Mode is not configured' });
-    }
+export async function verifyCheckoutSession(
+  req,
+  res,
+  { stripe, stripeSecretKey, bookingsCollection, paymentsCollection },
+) {
+  if (!stripe || !isTestStripeSecretKey(stripeSecretKey)) {
+    return res.status(503).send({ message: 'Stripe Test Mode is not configured' });
+  }
 
-    const { sessionId } = req.body || {};
-    const customerId = String(req.user?.id || '');
-    if (typeof sessionId !== 'string' || !sessionId.startsWith('cs_') || sessionId.length > 128) {
-      return res.status(400).send({ message: 'A valid Checkout Session ID is required' });
-    }
-    if (!isObjectId(customerId)) {
-      return res.status(401).send({ message: 'A valid customer session is required' });
-    }
+  const { sessionId } = req.body || {};
+  const customerId = String(req.user?.id || '');
+  if (typeof sessionId !== 'string' || !sessionId.startsWith('cs_') || sessionId.length > 128) {
+    return res.status(400).send({ message: 'A valid Checkout Session ID is required' });
+  }
+  if (!isObjectId(customerId)) {
+    return res.status(401).send({ message: 'A valid customer session is required' });
+  }
 
-    let session;
-    try {
-      session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
-    } catch (error) {
-      if (error?.code === 'resource_missing' || error?.statusCode === 404) {
-        return res.status(404).send({ message: 'Checkout Session not found' });
-      }
-      return res.status(502).send({ message: 'Unable to verify the Checkout Session with Stripe' });
-    }
-
-    if (!session || session.id !== sessionId || session.object !== 'checkout.session') {
+  let session;
+  try {
+    session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['payment_intent'] });
+  } catch (error) {
+    if (error?.code === 'resource_missing' || error?.statusCode === 404) {
       return res.status(404).send({ message: 'Checkout Session not found' });
     }
-    if (session.livemode !== false || session.mode !== 'payment') {
-      return res
-        .status(409)
-        .send({ message: 'Checkout Session is not a Test Mode payment session' });
+    return res.status(502).send({ message: 'Unable to verify the Checkout Session with Stripe' });
+  }
+
+  if (!session || session.id !== sessionId || session.object !== 'checkout.session') {
+    return res.status(404).send({ message: 'Checkout Session not found' });
+  }
+  if (session.livemode !== false || session.mode !== 'payment') {
+    return res.status(409).send({ message: 'Checkout Session is not a Test Mode payment session' });
+  }
+
+  const bookingId = session.metadata?.bookingId;
+  const sessionCustomerId = session.metadata?.customerId;
+  if (
+    !isObjectId(bookingId) ||
+    sessionCustomerId !== customerId ||
+    session.client_reference_id !== bookingId
+  ) {
+    return res.status(404).send({ message: 'Checkout Session does not belong to this customer' });
+  }
+
+  const bookingFilter = {
+    _id: new ObjectId(bookingId),
+    customerId: new ObjectId(customerId),
+    stripeSessionId: session.id,
+  };
+  const booking = await bookingsCollection.findOne(bookingFilter);
+  if (!booking)
+    return res.status(404).send({ message: 'Booking for this Checkout Session was not found' });
+
+  const expectedAmount = Math.round(Number(booking.totalAmount) * 100);
+  const expectedCurrency = String(booking.currency || 'bdt').toLowerCase();
+  if (
+    !Number.isSafeInteger(expectedAmount) ||
+    session.amount_total !== expectedAmount ||
+    String(session.currency || '').toLowerCase() !== expectedCurrency
+  ) {
+    return res
+      .status(409)
+      .send({ message: 'Checkout Session amount or currency does not match the booking' });
+  }
+
+  if (session.status === 'expired') {
+    return markUnpaidStatus(bookingFilter, bookingsCollection, res, 'expired', 'payment_expired');
+  }
+
+  if (session.payment_status !== 'paid') {
+    if (session.payment_status === 'no_payment_required') {
+      return res.send({ status: 'unpaid', bookingId: String(booking._id) });
     }
 
-    const bookingId = session.metadata?.bookingId;
-    const sessionCustomerId = session.metadata?.customerId;
+    let intent = typeof session.payment_intent === 'object' ? session.payment_intent : null;
+    if (session.status === 'complete' && !intent && session.payment_intent) {
+      try {
+        intent = await stripe.paymentIntents.retrieve(session.payment_intent);
+      } catch {
+        return res.status(502).send({ message: 'Unable to verify the Checkout payment status' });
+      }
+    }
+
     if (
-      !isObjectId(bookingId) ||
-      sessionCustomerId !== customerId ||
-      session.client_reference_id !== bookingId
+      session.status === 'complete' &&
+      ['requires_payment_method', 'canceled'].includes(intent?.status)
     ) {
-      return res.status(404).send({ message: 'Checkout Session does not belong to this customer' });
+      return markUnpaidStatus(bookingFilter, bookingsCollection, res, 'failed', 'payment_failed');
     }
+    return res.send({ status: 'pending', bookingId: String(booking._id) });
+  }
 
-    const bookingFilter = {
-      _id: new ObjectId(bookingId),
-      customerId: new ObjectId(customerId),
-      stripeSessionId: session.id,
-    };
-    const booking = await bookingsCollection.findOne(bookingFilter);
-    if (!booking)
-      return res.status(404).send({ message: 'Booking for this Checkout Session was not found' });
+  const intentId = paymentIntentId(session.payment_intent);
+  if (!intentId) {
+    return res.status(409).send({ message: 'Paid Checkout Session is missing its Payment Intent' });
+  }
 
-    const expectedAmount = Math.round(Number(booking.totalAmount) * 100);
-    const expectedCurrency = String(booking.currency || 'bdt').toLowerCase();
+  const existingPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
+  if (
+    existingPayment &&
+    (String(existingPayment.bookingId) !== String(booking._id) ||
+      String(existingPayment.customerId) !== customerId ||
+      existingPayment.paymentIntentId !== intentId)
+  ) {
+    return res
+      .status(409)
+      .send({ message: 'Checkout Session is already linked to a different payment' });
+  }
+
+  if (booking.paymentStatus !== 'paid') {
+    await bookingsCollection.updateOne(
+      { ...bookingFilter, paymentStatus: { $ne: 'paid' } },
+      {
+        $set: {
+          paymentStatus: 'paid',
+          bookingStatus: 'confirmed',
+          stripeCheckoutStatus: 'complete',
+          stripePaymentIntentId: intentId,
+          transactionId: intentId,
+          paidAt: new Date(),
+          updatedAt: new Date(),
+        },
+      },
+    );
+  }
+
+  const currentBooking = await bookingsCollection.findOne(bookingFilter);
+  if (
+    !currentBooking ||
+    currentBooking.paymentStatus !== 'paid' ||
+    currentBooking.stripeSessionId !== session.id ||
+    (currentBooking.stripePaymentIntentId && currentBooking.stripePaymentIntentId !== intentId)
+  ) {
+    return res.status(409).send({ message: 'Booking changed while payment was being verified' });
+  }
+
+  try {
+    await paymentsCollection.updateOne(
+      { stripeSessionId: session.id },
+      {
+        $set: {
+          paymentIntentId: intentId,
+          transactionId: intentId,
+          bookingId: currentBooking._id,
+          customerId: currentBooking.customerId,
+          ownerId: currentBooking.ownerId,
+          amount: currentBooking.totalAmount,
+          currency: expectedCurrency,
+          status: 'paid',
+          verifiedAt: new Date(),
+        },
+        $setOnInsert: { stripeSessionId: session.id, createdAt: new Date() },
+      },
+      { upsert: true },
+    );
+  } catch (error) {
+    // Concurrent idempotent verifications can race on the unique session index.
+    if (error?.code !== 11000) throw error;
+    const racedPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
     if (
-      !Number.isSafeInteger(expectedAmount) ||
-      session.amount_total !== expectedAmount ||
-      String(session.currency || '').toLowerCase() !== expectedCurrency
-    ) {
-      return res
-        .status(409)
-        .send({ message: 'Checkout Session amount or currency does not match the booking' });
-    }
-
-    if (session.status === 'expired') {
-      return markUnpaidStatus(bookingFilter, bookingsCollection, res, 'expired', 'payment_expired');
-    }
-
-    if (session.payment_status !== 'paid') {
-      if (session.payment_status === 'no_payment_required') {
-        return res.send({ status: 'unpaid', bookingId: String(booking._id) });
-      }
-
-      let intent = typeof session.payment_intent === 'object' ? session.payment_intent : null;
-      if (session.status === 'complete' && !intent && session.payment_intent) {
-        try {
-          intent = await stripe.paymentIntents.retrieve(session.payment_intent);
-        } catch {
-          return res.status(502).send({ message: 'Unable to verify the Checkout payment status' });
-        }
-      }
-
-      if (
-        session.status === 'complete' &&
-        ['requires_payment_method', 'canceled'].includes(intent?.status)
-      ) {
-        return markUnpaidStatus(bookingFilter, bookingsCollection, res, 'failed', 'payment_failed');
-      }
-      return res.send({ status: 'pending', bookingId: String(booking._id) });
-    }
-
-    const intentId = paymentIntentId(session.payment_intent);
-    if (!intentId) {
-      return res
-        .status(409)
-        .send({ message: 'Paid Checkout Session is missing its Payment Intent' });
-    }
-
-    const existingPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
-    if (
-      existingPayment &&
-      (String(existingPayment.bookingId) !== String(booking._id) ||
-        String(existingPayment.customerId) !== customerId ||
-        existingPayment.paymentIntentId !== intentId)
+      !racedPayment ||
+      String(racedPayment.bookingId) !== String(currentBooking._id) ||
+      String(racedPayment.customerId) !== customerId ||
+      racedPayment.paymentIntentId !== intentId
     ) {
       return res
         .status(409)
         .send({ message: 'Checkout Session is already linked to a different payment' });
     }
+  }
 
-    if (booking.paymentStatus !== 'paid') {
-      await bookingsCollection.updateOne(
-        { ...bookingFilter, paymentStatus: { $ne: 'paid' } },
-        {
-          $set: {
-            paymentStatus: 'paid',
-            bookingStatus: 'confirmed',
-            stripeCheckoutStatus: 'complete',
-            stripePaymentIntentId: intentId,
-            transactionId: intentId,
-            paidAt: new Date(),
-            updatedAt: new Date(),
-          },
-        },
-      );
-    }
-
-    const currentBooking = await bookingsCollection.findOne(bookingFilter);
-    if (
-      !currentBooking ||
-      currentBooking.paymentStatus !== 'paid' ||
-      currentBooking.stripeSessionId !== session.id ||
-      (currentBooking.stripePaymentIntentId && currentBooking.stripePaymentIntentId !== intentId)
-    ) {
-      return res.status(409).send({ message: 'Booking changed while payment was being verified' });
-    }
-
-    try {
-      await paymentsCollection.updateOne(
-        { stripeSessionId: session.id },
-        {
-          $set: {
-            paymentIntentId: intentId,
-            transactionId: intentId,
-            bookingId: currentBooking._id,
-            customerId: currentBooking.customerId,
-            ownerId: currentBooking.ownerId,
-            amount: currentBooking.totalAmount,
-            currency: expectedCurrency,
-            status: 'paid',
-            verifiedAt: new Date(),
-          },
-          $setOnInsert: { stripeSessionId: session.id, createdAt: new Date() },
-        },
-        { upsert: true },
-      );
-    } catch (error) {
-      // Concurrent idempotent verifications can race on the unique session index.
-      if (error?.code !== 11000) throw error;
-      const racedPayment = await paymentsCollection.findOne({ stripeSessionId: session.id });
-      if (
-        !racedPayment ||
-        String(racedPayment.bookingId) !== String(currentBooking._id) ||
-        String(racedPayment.customerId) !== customerId ||
-        racedPayment.paymentIntentId !== intentId
-      ) {
-        return res
-          .status(409)
-          .send({ message: 'Checkout Session is already linked to a different payment' });
-      }
-    }
-
-    return res.send({ status: 'paid', bookingId: String(currentBooking._id) });
+  return res.send({ status: 'paid', bookingId: String(currentBooking._id) });
 }
 
 async function markUnpaidStatus(
@@ -340,157 +335,154 @@ async function markUnpaidStatus(
   return res.send({ status: paymentStatus, bookingId: String(booking._id) });
 }
 
-export async function startCheckoutSession(req, res, {
-  stripe,
-  stripeSecretKey,
-  clientUrl,
-  bookingsCollection,
-  paymentsCollection,
-}) {
-    if (!stripe || !isTestStripeSecretKey(stripeSecretKey)) {
-      return res.status(503).send({ message: 'Stripe Test Mode is not configured' });
-    }
-    const { bookingId } = req.params || {};
-    const customerId = String(req.user?.id || '');
-    if (
-      typeof bookingId !== 'string' ||
-      !/^[a-f\d]{24}$/i.test(bookingId) ||
-      !ObjectId.isValid(bookingId)
-    ) {
-      return res.status(400).send({ message: 'Invalid booking id' });
-    }
+export async function startCheckoutSession(
+  req,
+  res,
+  { stripe, stripeSecretKey, clientUrl, bookingsCollection, paymentsCollection },
+) {
+  if (!stripe || !isTestStripeSecretKey(stripeSecretKey)) {
+    return res.status(503).send({ message: 'Stripe Test Mode is not configured' });
+  }
+  const { bookingId } = req.params || {};
+  const customerId = String(req.user?.id || '');
+  if (
+    typeof bookingId !== 'string' ||
+    !/^[a-f\d]{24}$/i.test(bookingId) ||
+    !ObjectId.isValid(bookingId)
+  ) {
+    return res.status(400).send({ message: 'Invalid booking id' });
+  }
 
-    try {
-      const bookingFilter = {
-        _id: new ObjectId(bookingId),
-        ...customerBookingFilter(customerId),
-        paymentStatus: { $in: ['pending', 'failed', 'cancelled'] },
-      };
-      let booking = await bookingsCollection.findOne(bookingFilter);
-      if (!canRetryBookingPayment(booking))
-        return res.status(404).send({ message: 'Booking is not eligible for payment' });
+  try {
+    const bookingFilter = {
+      _id: new ObjectId(bookingId),
+      ...customerBookingFilter(customerId),
+      paymentStatus: { $in: ['pending', 'failed', 'cancelled'] },
+    };
+    let booking = await bookingsCollection.findOne(bookingFilter);
+    if (!canRetryBookingPayment(booking))
+      return res.status(404).send({ message: 'Booking is not eligible for payment' });
 
-      let previousSession;
-      if (booking.stripeSessionId) {
-        try {
-          previousSession = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
-        } catch {
-          return res.status(502).send({ message: 'Unable to check the previous Checkout Session' });
-        }
-        if (previousSession.status === 'complete') {
-
-          const verificationResponse = {
-            statusCode: 200,
-            status(code) {
-              this.statusCode = code;
-              return this;
-            },
-            send(body) {
-              this.body = body;
-              return this;
-            },
-          };
-          await verifyCheckoutSession(
-            { body: { sessionId: booking.stripeSessionId }, user: req.user },
-            verificationResponse,
-            { stripe, stripeSecretKey, bookingsCollection, paymentsCollection },
-          );
-          if (verificationResponse.body?.status === 'paid') {
-            return res.status(409).send({
-              message:
-                'This booking is already paid. Refresh My Rentals to see the confirmed booking.',
-            });
-          }
-          if (verificationResponse.body?.status === 'pending') {
-            return res.status(409).send({
-              message:
-                'The previous payment is still processing. Wait for verification before retrying.',
-            });
-          }
-          if (verificationResponse.statusCode !== 200) {
-            return res.status(verificationResponse.statusCode).send(verificationResponse.body);
-          }
-          booking = await bookingsCollection.findOne(bookingFilter);
-          if (!canRetryBookingPayment(booking))
-            return res.status(409).send({ message: 'Booking is no longer eligible for payment' });
-        }
-      }
-
-      const checkoutAttemptId = randomUUID();
-      const lock = await bookingsCollection.updateOne(
-        {
-          ...bookingFilter,
-          bookingStatus: booking.bookingStatus,
-          $or: [
-            { checkoutAttemptAt: { $exists: false } },
-            { checkoutAttemptAt: { $lt: new Date(Date.now() - 120000) } },
-          ],
-        },
-        { $set: { checkoutAttemptId, checkoutAttemptAt: new Date() } },
-      );
-      if (!lock.matchedCount)
-        return res.status(409).send({ message: 'Checkout is already starting for this booking' });
-
-      let session;
+    let previousSession;
+    if (booking.stripeSessionId) {
       try {
-        if (booking.stripeSessionId && previousSession?.status === 'open') {
-          await stripe.checkout.sessions.expire(booking.stripeSessionId);
-        }
-        session = await stripe.checkout.sessions.create({
-          mode: 'payment',
-          line_items: [
-            {
-              price_data: {
-                currency: 'bdt',
-                product_data: { name: booking.equipmentTitle },
-                unit_amount: Math.round(booking.totalAmount * 100),
-              },
-              quantity: 1,
-            },
-          ],
-          success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-          cancel_url: `${clientUrl}/payment/cancel?booking_id=${booking._id}`,
-          client_reference_id: String(booking._id),
-          metadata: { bookingId: String(booking._id), customerId },
-        });
+        previousSession = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
       } catch {
-        await bookingsCollection.updateOne(
-          { _id: booking._id, checkoutAttemptId },
-          { $unset: { checkoutAttemptId: '', checkoutAttemptAt: '' } },
+        return res.status(502).send({ message: 'Unable to check the previous Checkout Session' });
+      }
+      if (previousSession.status === 'complete') {
+        const verificationResponse = {
+          statusCode: 200,
+          status(code) {
+            this.statusCode = code;
+            return this;
+          },
+          send(body) {
+            this.body = body;
+            return this;
+          },
+        };
+        await verifyCheckoutSession(
+          { body: { sessionId: booking.stripeSessionId }, user: req.user },
+          verificationResponse,
+          { stripe, stripeSecretKey, bookingsCollection, paymentsCollection },
         );
-        return res
-          .status(502)
-          .send({ message: 'Unable to safely start Checkout. Please try again.' });
+        if (verificationResponse.body?.status === 'paid') {
+          return res.status(409).send({
+            message:
+              'This booking is already paid. Refresh My Rentals to see the confirmed booking.',
+          });
+        }
+        if (verificationResponse.body?.status === 'pending') {
+          return res.status(409).send({
+            message:
+              'The previous payment is still processing. Wait for verification before retrying.',
+          });
+        }
+        if (verificationResponse.statusCode !== 200) {
+          return res.status(verificationResponse.statusCode).send(verificationResponse.body);
+        }
+        booking = await bookingsCollection.findOne(bookingFilter);
+        if (!canRetryBookingPayment(booking))
+          return res.status(409).send({ message: 'Booking is no longer eligible for payment' });
       }
-
-      const linked = await bookingsCollection.updateOne(
-        { ...bookingFilter, _id: booking._id, checkoutAttemptId },
-        {
-          $set: {
-            stripeSessionId: session.id,
-            paymentStatus: 'pending',
-            bookingStatus: 'pending_payment',
-            stripeCheckoutStatus: 'open',
-            updatedAt: new Date(),
-          },
-          $unset: {
-            failedAt: '',
-            stripePaymentIntentId: '',
-            checkoutAttemptId: '',
-            checkoutAttemptAt: '',
-          },
-        },
-      );
-      if (!linked.matchedCount) {
-        await stripe.checkout.sessions.expire(session.id).catch(() => {});
-        return res
-          .status(409)
-          .send({ message: 'Booking status changed. Please refresh and try again.' });
-      }
-      return res.send({ url: session.url });
-    } catch {
-      return res.status(500).send({ message: 'Unable to start checkout' });
     }
+
+    const checkoutAttemptId = randomUUID();
+    const lock = await bookingsCollection.updateOne(
+      {
+        ...bookingFilter,
+        bookingStatus: booking.bookingStatus,
+        $or: [
+          { checkoutAttemptAt: { $exists: false } },
+          { checkoutAttemptAt: { $lt: new Date(Date.now() - 120000) } },
+        ],
+      },
+      { $set: { checkoutAttemptId, checkoutAttemptAt: new Date() } },
+    );
+    if (!lock.matchedCount)
+      return res.status(409).send({ message: 'Checkout is already starting for this booking' });
+
+    let session;
+    try {
+      if (booking.stripeSessionId && previousSession?.status === 'open') {
+        await stripe.checkout.sessions.expire(booking.stripeSessionId);
+      }
+      session = await stripe.checkout.sessions.create({
+        mode: 'payment',
+        line_items: [
+          {
+            price_data: {
+              currency: 'bdt',
+              product_data: { name: booking.equipmentTitle },
+              unit_amount: Math.round(booking.totalAmount * 100),
+            },
+            quantity: 1,
+          },
+        ],
+        success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${clientUrl}/payment/cancel?booking_id=${booking._id}`,
+        client_reference_id: String(booking._id),
+        metadata: { bookingId: String(booking._id), customerId },
+      });
+    } catch {
+      await bookingsCollection.updateOne(
+        { _id: booking._id, checkoutAttemptId },
+        { $unset: { checkoutAttemptId: '', checkoutAttemptAt: '' } },
+      );
+      return res
+        .status(502)
+        .send({ message: 'Unable to safely start Checkout. Please try again.' });
+    }
+
+    const linked = await bookingsCollection.updateOne(
+      { ...bookingFilter, _id: booking._id, checkoutAttemptId },
+      {
+        $set: {
+          stripeSessionId: session.id,
+          paymentStatus: 'pending',
+          bookingStatus: 'pending_payment',
+          stripeCheckoutStatus: 'open',
+          updatedAt: new Date(),
+        },
+        $unset: {
+          failedAt: '',
+          stripePaymentIntentId: '',
+          checkoutAttemptId: '',
+          checkoutAttemptAt: '',
+        },
+      },
+    );
+    if (!linked.matchedCount) {
+      await stripe.checkout.sessions.expire(session.id).catch(() => {});
+      return res
+        .status(409)
+        .send({ message: 'Booking status changed. Please refresh and try again.' });
+    }
+    return res.send({ url: session.url });
+  } catch {
+    return res.status(500).send({ message: 'Unable to start checkout' });
+  }
 }
 
 const app = express();
