@@ -311,6 +311,32 @@ app.get("/api/bookings/my", verifyToken, verifyRenter, async (req, res) => {
     res.send({ bookings });
   } catch { res.status(500).send({ message: "Failed to load bookings" }); }
 });
+app.get("/api/customer/analytics", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const customerId = toObjectId(req.user.id);
+    const [totalBookings, activeRentals, completedRentals, pendingBookings, spending, monthlyRentals, recentBookings] = await Promise.all([
+      bookingsCollection.countDocuments({ customerId }),
+      bookingsCollection.countDocuments({ customerId, bookingStatus: { $in: ["confirmed", "active", "ongoing"] } }),
+      bookingsCollection.countDocuments({ customerId, bookingStatus: "completed" }),
+      bookingsCollection.countDocuments({ customerId, bookingStatus: { $in: ["pending", "pending_payment", "pending_approval"] } }),
+      paymentsCollection.aggregate([{ $match: { customerId, status: "paid" } }, { $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
+      bookingsCollection.aggregate([
+        { $match: { customerId } },
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$bookingDate" } }, total: { $sum: 1 } } },
+        { $sort: { _id: -1 } }, { $limit: 12 }, { $sort: { _id: 1 } },
+      ]).toArray(),
+      bookingsCollection.aggregate([
+        { $match: { customerId } }, { $sort: { bookingDate: -1 } }, { $limit: 5 },
+        { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
+        { $unwind: { path: "$equipment", preserveNullAndEmptyArrays: true } },
+        { $addFields: { equipmentTitle: { $ifNull: ["$equipment.title", "$equipmentTitle"] }, equipmentImage: "$equipment.image" } },
+        { $project: { equipment: 0 } },
+      ]).toArray(),
+    ]);
+    res.send({ totalBookings, activeRentals, completedRentals, pendingBookings, totalSpending: spending[0]?.total || 0, monthlyRentals, recentBookings });
+  } catch { res.status(500).send({ message: "Failed to calculate customer overview" }); }
+});
+
 app.get("/api/owner/bookings", verifyToken, verifyOwner, async (req, res) => {
   try {
     const bookings = await bookingsCollection.aggregate([
