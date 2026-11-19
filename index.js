@@ -295,6 +295,39 @@ app.post("/api/bookings", verifyToken, verifyRenter, async (req, res) => {
   } catch { res.status(500).send({ message: "Failed to create booking" }); }
 });
 
+app.get("/api/bookings/my", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const bookings = await bookingsCollection.aggregate([
+      { $match: { customerId: toObjectId(req.user.id) } },
+      { $sort: { bookingDate: -1 } },
+      { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
+      { $unwind: { path: "$equipment", preserveNullAndEmptyArrays: true } },
+      { $addFields: {
+        equipmentTitle: { $ifNull: ["$equipment.title", "$equipmentTitle"] },
+        equipmentImage: "$equipment.image",
+      } },
+      { $project: { equipment: 0 } },
+    ]).toArray();
+    res.send({ bookings });
+  } catch { res.status(500).send({ message: "Failed to load bookings" }); }
+});
+app.get("/api/owner/bookings", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const bookings = await bookingsCollection.aggregate([
+      { $match: { ownerId: toObjectId(req.user.id) } },
+      { $sort: { bookingDate: -1 } },
+      { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
+      { $unwind: { path: "$equipment", preserveNullAndEmptyArrays: true } },
+      { $addFields: {
+        equipmentTitle: { $ifNull: ["$equipment.title", "$equipmentTitle"] },
+        equipmentImage: "$equipment.image",
+      } },
+      { $project: { equipment: 0 } },
+    ]).toArray();
+    res.send({ bookings });
+  } catch { res.status(500).send({ message: "Failed to load owner rentals" }); }
+});
+
 // Stripe Checkout: only server-side booking amount is used.
 app.post("/api/payments/checkout/:bookingId", verifyToken, verifyRenter, async (req, res) => {
   if (!stripe) return res.status(503).send({ message: "Stripe is not configured" });
