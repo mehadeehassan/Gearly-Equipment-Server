@@ -60,6 +60,30 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 app.get("/", (req, res) => res.send({ message: "Gearly API is running" }));
 app.get("/api/health", (req, res) => res.send({ status: "ok" }));
 
+app.get("/api/equipment/featured", async (req, res) => {
+  try {
+    const equipment = await equipmentCollection.find({ status: "approved" }).sort({ createdAt: -1 }).limit(6).toArray();
+    res.send({ equipment });
+  } catch { res.status(500).send({ message: "Failed to load featured equipment" }); }
+});
+
+// Published reviews and clearly labeled demo reviews are read from MongoDB.
+app.get("/api/reviews", async (req, res) => {
+  try {
+    const reviews = await reviewsCollection.find({ status: { $in: ["approved", "published", "demo"] } }, { projection: { customerName: 1, rating: 1, comment: 1, createdAt: 1, demoOnly: 1 } }).sort({ createdAt: -1 }).limit(15).toArray();
+    res.send({ reviews });
+  } catch { res.status(500).send({ message: "Failed to load reviews" }); }
+});
+
+app.get("/api/equipment/:id", async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid equipment id" });
+    const equipment = await equipmentCollection.findOne({ _id: toObjectId(req.params.id), status: "approved" });
+    if (!equipment) return res.status(404).send({ message: "Equipment not found" });
+    res.send({ equipment });
+  } catch { res.status(500).send({ message: "Failed to load equipment details" }); }
+});
+
 // Profile is based on the verified token identity, never on a client-supplied user id.
 app.get("/api/profile", verifyToken, async (req, res) => {
   try {
