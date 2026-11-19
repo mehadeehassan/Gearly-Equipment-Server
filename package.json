@@ -1,0 +1,21 @@
+{
+  "name": "equipment-rental-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js",
+    "seed:demo-reviews": "node scripts/seed-demo-reviews.js",
+    "seed:test-equipment": "node scripts/seed-test-equipment.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.12.0",
+    "stripe": "^17.5.0"
+  }
+}
