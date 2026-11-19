@@ -541,6 +541,11 @@ const verifyRenter = (req, res, next) => {
     return res.status(403).send({ message: 'Renter access required' });
   next();
 };
+const verifyCustomer = (req, res, next) => {
+  if (!isRoleAllowed(req.user?.role, ['customer']))
+    return res.status(403).send({ message: 'Customer access required' });
+  next();
+};
 const verifyOwner = (req, res, next) => {
   if (!isRoleAllowed(req.user?.role, ['owner']))
     return res.status(403).send({ message: 'Owner access required' });
@@ -635,13 +640,13 @@ app.get('/api/equipment/featured', async (req, res) => {
   }
 });
 
-// Published reviews and clearly labeled demo reviews are read from MongoDB.
+// Public reviews only include submissions linked to a booking.
 app.get('/api/reviews', async (req, res) => {
   try {
     const reviews = await reviewsCollection
       .find(
-        { status: { $in: ['approved', 'published', 'demo'] } },
-        { projection: { customerName: 1, rating: 1, comment: 1, createdAt: 1, demoOnly: 1 } },
+        { status: 'approved', bookingId: { $type: 'objectId' } },
+        { projection: { customerName: 1, customerImage: 1, equipmentTitle: 1, rating: 1, comment: 1, createdAt: 1 } },
       )
       .sort({ createdAt: -1 })
       .limit(15)
@@ -649,6 +654,58 @@ app.get('/api/reviews', async (req, res) => {
     res.send({ reviews });
   } catch {
     res.status(500).send({ message: 'Failed to load reviews' });
+  }
+});
+
+app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
+  const fieldErrors = {};
+  const bookingId = validId(req.body?.bookingId) ? toObjectId(req.body.bookingId) : null;
+  const rating = Number(req.body?.rating);
+  const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : '';
+  if (!bookingId) fieldErrors.bookingId = 'Select a valid booking.';
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5)
+    fieldErrors.rating = 'Choose a rating from 1 to 5 stars.';
+  if (!comment) fieldErrors.comment = 'Write a comment before submitting.';
+  else if (comment.length > 1000) fieldErrors.comment = 'Keep your comment under 1000 characters.';
+  if (Object.keys(fieldErrors).length)
+    return res.status(400).send({ message: 'Please correct the review details.', fieldErrors });
+
+  try {
+    const customerId = toObjectId(req.user.id);
+    const customer = await usersCollection.findOne(
+      { _id: customerId },
+      { projection: { name: 1, image: 1, role: 1 } },
+    );
+    if (!customer || customer.role !== 'customer')
+      return res.status(403).send({ message: 'Customer access required' });
+
+    const booking = await bookingsCollection.findOne({
+      _id: bookingId,
+      customerId,
+      paymentStatus: 'paid',
+      bookingStatus: 'completed',
+    });
+    if (!booking)
+      return res.status(403).send({ message: 'A review is available after your paid rental is completed.' });
+
+    const review = {
+      customerId,
+      customerName: customer.name || req.user.name || 'Gearly customer',
+      customerImage: customer.image || '',
+      bookingId: booking._id,
+      equipmentId: booking.equipmentId,
+      equipmentTitle: booking.equipmentTitle || '',
+      rating,
+      comment,
+      status: 'approved',
+      createdAt: new Date(),
+    };
+    const result = await reviewsCollection.insertOne(review);
+    return res.status(201).send({ review: { ...review, _id: result.insertedId } });
+  } catch (error) {
+    if (error?.code === 11000)
+      return res.status(409).send({ message: 'You have already reviewed this rental.' });
+    return res.status(500).send({ message: 'Unable to submit your review. Please try again.' });
   }
 });
 
@@ -968,7 +1025,20 @@ app.get('/api/bookings/my', verifyToken, verifyRenter, async (req, res) => {
         { $project: { equipment: 0 } },
       ])
       .toArray();
-    res.send({ bookings });
+    const reviewedBookingIds = bookings.length
+      ? new Set(
+          (await reviewsCollection
+            .find(
+              {
+                customerId: toObjectId(req.user.id),
+                bookingId: { $in: bookings.map((booking) => booking._id) },
+              },
+              { projection: { bookingId: 1 } },
+            )
+            .toArray()).map((review) => String(review.bookingId)),
+        )
+      : new Set();
+    res.send({ bookings: bookings.map((booking) => ({ ...booking, reviewed: reviewedBookingIds.has(String(booking._id)) })) });
   } catch {
     res.status(500).send({ message: 'Failed to load bookings' });
   }
@@ -1372,6 +1442,10 @@ async function startServer() {
       equipmentCollection.createIndex({ status: 1, category: 1, createdAt: -1 }),
       paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
       paymentsCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true }),
+      reviewsCollection.createIndex(
+        { bookingId: 1 },
+        { unique: true, partialFilterExpression: { bookingId: { $exists: true } } },
+      ),
     ]);
     app.listen(port, () => console.log(`Gearly API listening on port ${port}`));
   } catch (error) {
