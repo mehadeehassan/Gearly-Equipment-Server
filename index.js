@@ -208,6 +208,39 @@ app.delete("/api/owner/equipment/:id", verifyToken, verifyOwner, async (req, res
 });
 
 // Favorites.
+// Favorites.
+app.get("/api/favorites", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    const favorites = await favoritesCollection.aggregate([
+      { $match: { userId: toObjectId(req.user.id) } },
+      { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
+      { $unwind: "$equipment" }
+    ]).toArray();
+    res.send({ favorites });
+  } catch { res.status(500).send({ message: "Failed to load favorites" }); }
+});
+app.post("/api/favorites/:equipmentId", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    if (!validId(req.params.equipmentId)) return res.status(400).send({ message: "Invalid equipment id" });
+    const equipment = await equipmentCollection.findOne({ _id: toObjectId(req.params.equipmentId), status: "approved" });
+    if (!equipment) return res.status(404).send({ message: "Equipment not found" });
+    await favoritesCollection.updateOne(
+      { userId: toObjectId(req.user.id), equipmentId: equipment._id },
+      { $setOnInsert: { userId: toObjectId(req.user.id), equipmentId: equipment._id, createdAt: new Date() } },
+      { upsert: true }
+    );
+    res.status(201).send({ message: "Added to favorites" });
+  } catch { res.status(500).send({ message: "Failed to add favorite" }); }
+});
+app.delete("/api/favorites/:equipmentId", verifyToken, verifyRenter, async (req, res) => {
+  try {
+    if (!validId(req.params.equipmentId)) return res.status(400).send({ message: "Invalid equipment id" });
+    await favoritesCollection.deleteOne({ userId: toObjectId(req.user.id), equipmentId: toObjectId(req.params.equipmentId) });
+    res.send({ message: "Favorite removed" });
+  } catch { res.status(500).send({ message: "Failed to remove favorite" }); }
+});
+
+// Booking creation checks dates, quantities and calculates the amount on the server.
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
