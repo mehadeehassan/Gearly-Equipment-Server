@@ -1,3 +1,4 @@
+import { createStripeWebhookHandler } from "./stripe-webhook.js";
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
@@ -25,6 +26,20 @@ function myLogger(req, res, next) {
   next();
 }
 app.use(myLogger);
+// Stripe needs the untouched request body for signature verification. This route
+// must be registered before express.json parses other API request bodies.
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  (req, res) => createStripeWebhookHandler({
+    stripe,
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+    bookingsCollection,
+    paymentsCollection,
+    stripeEventsCollection,
+  })(req, res),
+);
+
 app.use(express.json({ limit: "2mb" }));
 import jwt from "jsonwebtoken";
 function verifyToken(req, res, next) {
