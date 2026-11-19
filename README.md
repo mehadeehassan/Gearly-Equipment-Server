@@ -14,8 +14,7 @@ Standalone Express API for the Gearly equipment rental marketplace. Uses the Mon
 - `PORT`, `CLIENT_URL`: API port and allowed frontend origin.
 - `MONGODB_URI`, `DB_NAME`: MongoDB connection and database.
 - `JWT_SECRET`, `JWT_ISSUER`, `JWT_AUDIENCE`: must exactly match the Next.js client values. The client signs a short-lived HS256 service token on the server after checking the Better Auth session.
-- `STRIPE_SECRET_KEY`: Stripe secret API key; keep it server-side.
-- `STRIPE_WEBHOOK_SECRET`: webhook signing secret from Stripe CLI or Dashboard. It is not a publishable key.
+- `STRIPE_SECRET_KEY`: a Stripe Test Mode secret or restricted key for local Checkout. Keep it server-side.
 
 Never commit `.env`.
 
@@ -28,7 +27,7 @@ Never commit `.env`.
 - Profile read/update.
 - Owner equipment create/read/update/delete.
 - Customer favorites and rental booking with overlapping-date quantity availability checks.
-- Stripe-hosted Checkout and verified webhook payment record.
+- Stripe-hosted Checkout and authenticated server-side Checkout Session verification.
 - Admin user role management, equipment approval/rejection/update/delete and rental listing.
 - Admin and owner analytics using MongoDB aggregation.
 
@@ -46,8 +45,6 @@ The user ID in the service token must be a 24-character MongoDB ObjectId-compati
 
 ## Stripe notes
 
-Checkout is hosted by Stripe; the client redirects to the returned Checkout URL. The webhook endpoint is `POST /api/payments/webhook` and must be registered with Stripe (or forwarded locally with Stripe CLI). Stripe cannot send events directly to a `localhost` URL. For local testing, install and authenticate Stripe CLI, then run `stripe listen --forward-to localhost:5000/api/payments/webhook`. Copy the listener's `whsec_...` value into `STRIPE_WEBHOOK_SECRET` and restart the server. The listener must remain running during checkout testing.
+Checkout is hosted by Stripe; the client redirects to the returned Checkout URL. After Stripe redirects to the success page, the authenticated client submits only the Checkout Session ID to `POST /api/payments/verify-session`. The server retrieves the Session with `STRIPE_SECRET_KEY` and verifies Test Mode, customer and booking linkage, amount, currency, and `payment_status` before updating MongoDB. No webhook secret, Stripe CLI forwarding, or Dashboard webhook is needed for this localhost flow.
 
-Subscribe to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed`, and `checkout.session.expired`. For a deployed API, create a Stripe Dashboard webhook endpoint pointing to its public `/api/payments/webhook` URL and set that endpoint's signing secret as `STRIPE_WEBHOOK_SECRET`. The endpoint verifies the untouched request body and signature. Only a session confirmed as paid changes the booking to `paid`; repeated events are deduplicated.
-
-The Checkout implementation currently uses BDT. Confirm your Stripe account supports the intended currency before going live. Production inventory reservation and webhook processing should be made transaction-safe/idempotent with a MongoDB replica set.
+This return-page verification is intended for local synchronous Test Mode card payments. A customer who pays but never returns to Gearly will not trigger a database update. Use signed webhooks before production or enabling delayed/asynchronous payment methods. The Checkout implementation currently uses BDT and verifies that currency against the booking.

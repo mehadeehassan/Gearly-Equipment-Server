@@ -4,7 +4,7 @@ import "dotenv/config";
 import jwt from "jsonwebtoken";
 import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
-import { createStripeWebhookHandler } from "./stripe-webhook.js";
+import { createPaymentVerificationHandler, isTestStripeSecretKey } from "./payment-verification.js";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -24,27 +24,13 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
 
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", credentials: true }));
 
-let usersCollection, equipmentCollection, bookingsCollection, favoritesCollection, paymentsCollection, reviewsCollection, stripeEventsCollection;
+let usersCollection, equipmentCollection, bookingsCollection, favoritesCollection, paymentsCollection, reviewsCollection;
 
 function myLogger(req, res, next) {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
 }
 app.use(myLogger);
-
-// Stripe needs the untouched request body for signature verification. This route
-// must be registered before express.json parses other API request bodies.
-app.post(
-  "/api/payments/webhook",
-  express.raw({ type: "application/json" }),
-  (req, res) => createStripeWebhookHandler({
-    stripe,
-    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
-    bookingsCollection,
-    paymentsCollection,
-    stripeEventsCollection,
-  })(req, res),
-);
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -82,6 +68,18 @@ const verifyAdmin = (req, res, next) => {
 const validId = (id) => ObjectId.isValid(id);
 const toObjectId = (id) => new ObjectId(id);
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+app.post(
+  "/api/payments/verify-session",
+  verifyToken,
+  verifyRenter,
+  (req, res) => createPaymentVerificationHandler({
+    stripe,
+    stripeSecretKey: process.env.STRIPE_SECRET_KEY,
+    bookingsCollection,
+    paymentsCollection,
+  })(req, res),
+);
 
 app.get("/", (req, res) => res.send({ message: "Gearly API is running" }));
 app.get("/api/health", (req, res) => res.send({ status: "ok" }));
@@ -363,7 +361,9 @@ app.get("/api/owner/bookings", verifyToken, verifyOwner, async (req, res) => {
 
 // Stripe Checkout: only server-side booking amount is used.
 app.post("/api/payments/checkout/:bookingId", verifyToken, verifyRenter, async (req, res) => {
-  if (!stripe) return res.status(503).send({ message: "Stripe is not configured" });
+  if (!stripe || !isTestStripeSecretKey(process.env.STRIPE_SECRET_KEY)) {
+    return res.status(503).send({ message: "Stripe Test Mode is not configured" });
+  }
   if (!validId(req.params.bookingId)) return res.status(400).send({ message: "Invalid booking id" });
   try {
     const booking = await bookingsCollection.findOne({
@@ -528,7 +528,6 @@ async function startServer() {
     favoritesCollection = db.collection("favorites");
     paymentsCollection = db.collection("payments");
     reviewsCollection = db.collection("reviews");
-    stripeEventsCollection = db.collection("stripeEvents");
     await Promise.all([
       favoritesCollection.createIndex({ userId: 1, equipmentId: 1 }, { unique: true }),
       bookingsCollection.createIndex({ customerId: 1, bookingDate: -1 }),
@@ -536,7 +535,6 @@ async function startServer() {
       equipmentCollection.createIndex({ status: 1, category: 1, createdAt: -1 }),
       paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
       paymentsCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true }),
-      stripeEventsCollection.createIndex({ eventId: 1 }, { unique: true }),
     ]);
     app.listen(port, () => console.log(`Gearly API listening on port ${port}`));
   } catch (error) {
