@@ -255,7 +255,15 @@ app.post("/api/bookings", verifyToken, verifyRenter, async (req, res) => {
   try {
     const equipment = await equipmentCollection.findOne({ _id: toObjectId(equipmentId), status: "approved" });
     if (!equipment) return res.status(404).send({ message: "Equipment not found" });
-    if (Number(equipment.availableQuantity || 0) < requestedQuantity) return res.status(409).send({ message: "Requested quantity is not available" });
+    const overlappingBookings = await bookingsCollection.find({
+      equipmentId: equipment._id,
+      bookingStatus: { $nin: ["cancelled", "rejected"] },
+      startDate: { $lt: end },
+      endDate: { $gt: start }
+    }, { projection: { quantity: 1 } }).toArray();
+    const reservedQuantity = overlappingBookings.reduce((total, booking) => total + Number(booking.quantity || 0), 0);
+    const remainingQuantity = Number(equipment.availableQuantity || 0) - reservedQuantity;
+    if (remainingQuantity < requestedQuantity) return res.status(409).send({ message: `Only ${Math.max(0, remainingQuantity)} item(s) are available for these dates` });
     const duration = Math.ceil((end - start) / 86400000);
     const multiplier = equipment.rentalType === "Weekly" ? Math.ceil(duration / 7) : equipment.rentalType === "Monthly" ? Math.ceil(duration / 30) : duration;
     const totalAmount = Number(equipment.price) * multiplier * requestedQuantity;
