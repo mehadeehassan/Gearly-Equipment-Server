@@ -1,8 +1,10 @@
-import { createStripeWebhookHandler } from "./stripe-webhook.js";
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
+import jwt from "jsonwebtoken";
 import { MongoClient, ObjectId } from "mongodb";
+import Stripe from "stripe";
+import { createStripeWebhookHandler } from "./stripe-webhook.js";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -17,15 +19,19 @@ export async function connectToMongoDB() {
     throw err;
   }
 }
-let usersCollection, equipmentCollection, bookingsCollection, favoritesCollection, paymentsCollection, reviewsCollection, stripeEventsCollection;
-import Stripe from "stripe";
+
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", credentials: true }));
+
+let usersCollection, equipmentCollection, bookingsCollection, favoritesCollection, paymentsCollection, reviewsCollection, stripeEventsCollection;
+
 function myLogger(req, res, next) {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
 }
 app.use(myLogger);
+
 // Stripe needs the untouched request body for signature verification. This route
 // must be registered before express.json parses other API request bodies.
 app.post(
@@ -41,7 +47,7 @@ app.post(
 );
 
 app.use(express.json({ limit: "2mb" }));
-import jwt from "jsonwebtoken";
+
 function verifyToken(req, res, next) {
   const authorization = req.headers.authorization;
   if (!authorization || !authorization.startsWith("Bearer ")) {
@@ -59,6 +65,7 @@ function verifyToken(req, res, next) {
     return res.status(401).send({ message: "Invalid or expired token" });
   }
 }
+
 const verifyRenter = (req, res, next) => {
   if (req.user?.role !== "customer" && req.user?.role !== "renter") return res.status(403).send({ message: "Renter access required" });
   next();
@@ -71,9 +78,11 @@ const verifyAdmin = (req, res, next) => {
   if (req.user?.role !== "admin") return res.status(403).send({ message: "Admin access required" });
   next();
 };
+
 const validId = (id) => ObjectId.isValid(id);
 const toObjectId = (id) => new ObjectId(id);
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 app.get("/", (req, res) => res.send({ message: "Gearly API is running" }));
 app.get("/api/health", (req, res) => res.send({ status: "ok" }));
 
@@ -225,7 +234,6 @@ app.delete("/api/owner/equipment/:id", verifyToken, verifyOwner, async (req, res
 });
 
 // Favorites.
-// Favorites.
 app.get("/api/favorites", verifyToken, verifyRenter, async (req, res) => {
   try {
     const favorites = await favoritesCollection.aggregate([
@@ -257,7 +265,6 @@ app.delete("/api/favorites/:equipmentId", verifyToken, verifyRenter, async (req,
   } catch { res.status(500).send({ message: "Failed to remove favorite" }); }
 });
 
-// Booking creation checks dates, quantities and calculates the amount on the server.
 // Booking creation checks dates, quantities and calculates the amount on the server.
 app.post("/api/bookings", verifyToken, verifyRenter, async (req, res) => {
   const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } = req.body;
@@ -460,6 +467,50 @@ app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
   } catch { res.status(500).send({ message: "Failed to load bookings" }); }
 });
 
+// Dynamic analytics using MongoDB aggregation.
+app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [totalUsers,totalEquipment,totalBookings,pendingApprovals,completedRentals,revenue,monthlyBookings,monthlyRevenue] = await Promise.all([
+      usersCollection.countDocuments({}), equipmentCollection.countDocuments({}), bookingsCollection.countDocuments({}),
+      equipmentCollection.countDocuments({ status: "pending" }), bookingsCollection.countDocuments({ bookingStatus: "completed" }),
+      paymentsCollection.aggregate([{ $match: { status: "paid" } },{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
+      bookingsCollection.aggregate([
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$bookingDate" } }, total: { $sum: 1 } } },
+        { $sort: { _id: -1 } },
+        { $limit: 12 },
+        { $sort: { _id: 1 } }
+      ]).toArray(),
+      paymentsCollection.aggregate([
+        { $match: { status: "paid" } },
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, total: { $sum: "$amount" } } },
+        { $sort: { _id: -1 } }, { $limit: 12 }, { $sort: { _id: 1 } },
+      ]).toArray()
+    ]);
+    res.send({ totalUsers,totalEquipment,totalBookings,pendingApprovals,completedRentals,totalRevenue:revenue[0]?.total||0,monthlyBookings,monthlyRevenue });
+  } catch { res.status(500).send({ message: "Failed to calculate analytics" }); }
+});
+app.get("/api/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const ownerId = toObjectId(req.user.id);
+    const [totalEquipment,approvedEquipment,pendingEquipment,totalBookings,activeRentals,completedRentals,earnings,monthlyEarnings] = await Promise.all([
+      equipmentCollection.countDocuments({ ownerId }),
+      equipmentCollection.countDocuments({ ownerId, status: "approved" }),
+      equipmentCollection.countDocuments({ ownerId, status: "pending" }),
+      bookingsCollection.countDocuments({ ownerId }),
+      bookingsCollection.countDocuments({ ownerId, bookingStatus: { $in: ["confirmed", "active", "ongoing"] } }),
+      bookingsCollection.countDocuments({ ownerId, bookingStatus: "completed" }),
+      paymentsCollection.aggregate([{ $match: { ownerId, status: "paid" } },{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
+      paymentsCollection.aggregate([
+        { $match: { ownerId, status: "paid" } },
+        { $group: { _id: { $dateToString: { format: "%Y-%m", date: "$createdAt" } }, total: { $sum: "$amount" } } },
+        { $sort: { _id: -1 } },
+        { $limit: 12 },
+        { $sort: { _id: 1 } }
+      ]).toArray()
+    ]);
+    res.send({ totalEquipment,approvedEquipment,pendingEquipment,totalBookings,activeRentals,completedRentals,totalEarnings:earnings[0]?.total||0,monthlyEarnings });
+  } catch { res.status(500).send({ message: "Failed to calculate owner analytics" }); }
+});
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
