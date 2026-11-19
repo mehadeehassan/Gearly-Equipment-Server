@@ -17,6 +17,13 @@ export async function connectToMongoDB() {
   }
 }
 let usersCollection, equipmentCollection, bookingsCollection, favoritesCollection, paymentsCollection, reviewsCollection, stripeEventsCollection;
+app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", credentials: true }));
+function myLogger(req, res, next) {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+  next();
+}
+app.use(myLogger);
+app.use(express.json({ limit: "2mb" }));
 app.get("/", (req, res) => res.send({ message: "Gearly API is running" }));
 app.get("/api/health", (req, res) => res.send({ status: "ok" }));
 
