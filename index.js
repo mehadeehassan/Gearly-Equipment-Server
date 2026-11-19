@@ -24,9 +24,71 @@ function myLogger(req, res, next) {
 }
 app.use(myLogger);
 app.use(express.json({ limit: "2mb" }));
+import jwt from "jsonwebtoken";
+function verifyToken(req, res, next) {
+  const authorization = req.headers.authorization;
+  if (!authorization || !authorization.startsWith("Bearer ")) {
+    return res.status(401).send({ message: "Unauthorized access" });
+  }
+  const token = authorization.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+      issuer: process.env.JWT_ISSUER,
+      audience: process.env.JWT_AUDIENCE
+    });
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).send({ message: "Invalid or expired token" });
+  }
+}
+const validId = (id) => ObjectId.isValid(id);
+const toObjectId = (id) => new ObjectId(id);
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 app.get("/", (req, res) => res.send({ message: "Gearly API is running" }));
 app.get("/api/health", (req, res) => res.send({ status: "ok" }));
 
+// Profile is based on the verified token identity, never on a client-supplied user id.
+app.get("/api/profile", verifyToken, async (req, res) => {
+  try {
+    const user = await usersCollection.findOne({ _id: req.user.id }, { projection: { password: 0 } });
+    if (!user) return res.status(404).send({ message: "User not found" });
+    const { _id, ...profile } = user;
+    res.send({ user: { ...profile, id: _id } });
+  } catch { res.status(500).send({ message: "Failed to load profile" }); }
+});
+
+app.patch("/api/profile", verifyToken, async (req, res) => {
+  try {
+    const { name, image, phone, address } = req.body || {};
+    const update = {};
+    if (typeof name === "string") update.name = name.trim();
+    if (typeof image === "string") update.image = image.trim();
+    if (typeof phone === "string") update.phone = phone.trim();
+    if (typeof address === "string") update.address = address.trim();
+    if (!Object.keys(update).length) {
+      return res.status(400).send({ message: "Provide at least one editable profile field: name, image, phone, or address" });
+    }
+
+    const result = await usersCollection.updateOne(
+      { _id: req.user.id },
+      { $set: { ...update, updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) return res.status(404).send({ message: "User not found" });
+
+    const user = await usersCollection.findOne(
+      { _id: req.user.id },
+      { projection: { password: 0 } }
+    );
+    const { _id, ...profile } = user;
+    res.send({ message: "Profile updated", user: { ...profile, id: _id } });
+  } catch (error) {
+    console.error("Failed to update profile", error);
+    res.status(500).send({ message: "Failed to update profile" });
+  }
+});
+
+// Owner equipment management.
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
