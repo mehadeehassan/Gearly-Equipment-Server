@@ -60,6 +60,35 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 app.get("/", (req, res) => res.send({ message: "Gearly API is running" }));
 app.get("/api/health", (req, res) => res.send({ status: "ok" }));
 
+// Public equipment list with server-side search, filtering, sorting and pagination.
+app.get("/api/equipment", async (req, res) => {
+  try {
+    const { search, category, rentalType, availability, minPrice, maxPrice } = req.query;
+    const query = { status: "approved" };
+    if (category) query.category = category;
+    if (rentalType) query.rentalType = rentalType;
+    if (availability === "available") query.availableQuantity = { $gt: 0 };
+    if (availability === "unavailable") query.availableQuantity = { $lte: 0 };
+    if (minPrice !== undefined || maxPrice !== undefined) {
+      query.price = {};
+      if (minPrice !== undefined && Number.isFinite(Number(minPrice))) query.price.$gte = Math.max(0, Number(minPrice));
+      if (maxPrice !== undefined && Number.isFinite(Number(maxPrice))) query.price.$lte = Math.max(0, Number(maxPrice));
+      if (!Object.keys(query.price).length) delete query.price;
+    }
+    if (search) {
+      const safeSearch = new RegExp(escapeRegex(String(search)), "i");
+      query.$or = [{ title: safeSearch }, { category: safeSearch }, { location: safeSearch }];
+    }
+    const [equipment, total] = await Promise.all([
+      equipmentCollection.find(query).toArray(),
+      equipmentCollection.countDocuments(query)
+    ]);
+    res.send({ equipment, total });
+  } catch (error) {
+    res.status(500).send({ message: "Failed to load equipment" });
+  }
+});
+
 app.get("/api/equipment/featured", async (req, res) => {
   try {
     const equipment = await equipmentCollection.find({ status: "approved" }).sort({ createdAt: -1 }).limit(6).toArray();
