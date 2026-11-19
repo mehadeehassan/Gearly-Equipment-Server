@@ -101,6 +101,23 @@ app.patch("/api/profile", verifyToken, async (req, res) => {
 });
 
 // Owner equipment management.
+app.post("/api/owner/equipment", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const { title, description, category, location, price, rentalType, availableQuantity, condition, brand, model, image, terms } = req.body;
+    if (!title || !description || !category || !location || !price || !rentalType || !image) {
+      return res.status(400).send({ message: "Please provide all required equipment fields" });
+    }
+    const doc = {
+      title: title.trim(), description, category, location: location.trim(), price: Number(price), rentalType,
+      availableQuantity: Math.max(0, Number(availableQuantity) || 0), condition, brand, model, image, terms,
+      ownerId: toObjectId(req.user.id), ownerName: req.user.name || "", status: "pending",
+      createdAt: new Date(), updatedAt: new Date()
+    };
+    const result = await equipmentCollection.insertOne(doc);
+    res.status(201).send({ message: "Equipment submitted for approval", insertedId: result.insertedId });
+  } catch { res.status(500).send({ message: "Failed to add equipment" }); }
+});
+
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
