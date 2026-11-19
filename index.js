@@ -118,6 +118,40 @@ app.post("/api/owner/equipment", verifyToken, verifyOwner, async (req, res) => {
   } catch { res.status(500).send({ message: "Failed to add equipment" }); }
 });
 
+app.get("/api/owner/equipment", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const equipment = await equipmentCollection.find({ ownerId: toObjectId(req.user.id) }).sort({ createdAt: -1 }).toArray();
+    res.send({ equipment });
+  } catch { res.status(500).send({ message: "Failed to load your equipment" }); }
+});
+
+app.patch("/api/owner/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid equipment id" });
+    const allowed = ["title","description","category","location","price","rentalType","availableQuantity","condition","brand","model","image","terms"];
+    const update = {};
+    for (const key of allowed) if (req.body[key] !== undefined) update[key] = req.body[key];
+    if (update.price !== undefined) update.price = Number(update.price);
+    if (update.availableQuantity !== undefined) update.availableQuantity = Number(update.availableQuantity);
+    const result = await equipmentCollection.updateOne(
+      { _id: toObjectId(req.params.id), ownerId: toObjectId(req.user.id) },
+      { $set: { ...update, status: "pending", updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) return res.status(404).send({ message: "Equipment not found" });
+    res.send({ message: "Equipment updated and sent for review" });
+  } catch { res.status(500).send({ message: "Failed to update equipment" }); }
+});
+
+app.delete("/api/owner/equipment/:id", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid equipment id" });
+    const result = await equipmentCollection.deleteOne({ _id: toObjectId(req.params.id), ownerId: toObjectId(req.user.id) });
+    if (!result.deletedCount) return res.status(404).send({ message: "Equipment not found" });
+    res.send({ message: "Equipment deleted" });
+  } catch { res.status(500).send({ message: "Failed to delete equipment" }); }
+});
+
+// Favorites.
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
