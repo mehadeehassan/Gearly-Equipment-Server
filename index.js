@@ -17,6 +17,8 @@ export async function connectToMongoDB() {
   }
 }
 let usersCollection, equipmentCollection, bookingsCollection, favoritesCollection, paymentsCollection, reviewsCollection, stripeEventsCollection;
+import Stripe from "stripe";
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000", credentials: true }));
 function myLogger(req, res, next) {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
@@ -276,6 +278,46 @@ app.post("/api/bookings", verifyToken, verifyRenter, async (req, res) => {
     const result = await bookingsCollection.insertOne(booking);
     res.status(201).send({ message: "Booking created", bookingId: result.insertedId, totalAmount });
   } catch { res.status(500).send({ message: "Failed to create booking" }); }
+});
+
+// Stripe Checkout: only server-side booking amount is used.
+app.post("/api/payments/checkout/:bookingId", verifyToken, verifyRenter, async (req, res) => {
+  if (!stripe) return res.status(503).send({ message: "Stripe is not configured" });
+  if (!validId(req.params.bookingId)) return res.status(400).send({ message: "Invalid booking id" });
+  try {
+    const booking = await bookingsCollection.findOne({
+      _id: toObjectId(req.params.bookingId),
+      customerId: toObjectId(req.user.id),
+      paymentStatus: { $in: ["pending", "failed", "cancelled"] },
+    });
+    if (!booking) return res.status(404).send({ message: "Pending booking not found" });
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      line_items: [{ price_data: { currency: "bdt", product_data: { name: booking.equipmentTitle }, unit_amount: Math.round(booking.totalAmount * 100) }, quantity: 1 }],
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel?booking_id=${booking._id}`,
+      client_reference_id: String(booking._id),
+      metadata: { bookingId: String(booking._id), customerId: String(req.user.id) }
+    });
+    const linked = await bookingsCollection.updateOne(
+      { _id: booking._id, customerId: toObjectId(req.user.id), paymentStatus: { $in: ["pending", "failed", "cancelled"] } },
+      {
+        $set: {
+          stripeSessionId: session.id,
+          paymentStatus: "pending",
+          bookingStatus: "pending_payment",
+          stripeCheckoutStatus: "open",
+          updatedAt: new Date(),
+        },
+        $unset: { failedAt: "", stripePaymentIntentId: "" },
+      },
+    );
+    if (!linked.matchedCount) {
+      await stripe.checkout.sessions.expire(session.id).catch(() => {});
+      return res.status(409).send({ message: "Booking status changed. Please refresh and try again." });
+    }
+    res.send({ url: session.url });
+  } catch { res.status(500).send({ message: "Unable to start checkout" }); }
 });
 
 
