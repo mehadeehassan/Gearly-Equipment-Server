@@ -394,6 +394,72 @@ app.post("/api/payments/checkout/:bookingId", verifyToken, verifyRenter, async (
   } catch { res.status(500).send({ message: "Unable to start checkout" }); }
 });
 
+// Admin management.
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  try { const users = await usersCollection.find({}, { projection: { password: 0 } }).sort({ createdAt: -1 }).toArray(); res.send({ users }); }
+  catch { res.status(500).send({ message: "Failed to load users" }); }
+});
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid user id" });
+    if (!["customer","owner","admin"].includes(req.body.role)) return res.status(400).send({ message: "Invalid role" });
+    if (String(req.user.id) === req.params.id && req.body.role !== "admin") return res.status(400).send({ message: "You cannot remove your own admin role" });
+    const result = await usersCollection.updateOne({ _id: req.params.id }, { $set: { role: req.body.role, updatedAt: new Date() } });
+    if (!result.matchedCount) return res.status(404).send({ message: "User not found" });
+    res.send({ message: "User role updated" });
+  } catch { res.status(500).send({ message: "Failed to update user role" }); }
+});
+app.get("/api/admin/equipment", verifyToken, verifyAdmin, async (req, res) => {
+  try { const equipment = await equipmentCollection.find({}).sort({ createdAt: -1 }).toArray(); res.send({ equipment }); }
+  catch { res.status(500).send({ message: "Failed to load equipment" }); }
+});
+app.patch("/api/admin/equipment/:id/status", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid equipment id" });
+    if (!["approved","rejected","pending"].includes(req.body.status)) return res.status(400).send({ message: "Invalid status" });
+    const result = await equipmentCollection.updateOne({ _id: toObjectId(req.params.id) }, { $set: { status: req.body.status, updatedAt: new Date() } });
+    if (!result.matchedCount) return res.status(404).send({ message: "Equipment not found" });
+    res.send({ message: "Equipment status updated" });
+  } catch { res.status(500).send({ message: "Failed to update equipment status" }); }
+});
+app.patch("/api/admin/equipment/:id", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid equipment id" });
+    const allowed = ["title", "description", "category", "location", "price", "rentalType", "availableQuantity", "condition", "brand", "model", "image", "terms"];
+    const update = {};
+    for (const key of allowed) if (req.body[key] !== undefined) update[key] = req.body[key];
+    if (update.price !== undefined) update.price = Number(update.price);
+    if (update.availableQuantity !== undefined) update.availableQuantity = Number(update.availableQuantity);
+    const result = await equipmentCollection.updateOne({ _id: toObjectId(req.params.id) }, { $set: { ...update, updatedAt: new Date() } });
+    if (!result.matchedCount) return res.status(404).send({ message: "Equipment not found" });
+    res.send({ message: "Equipment updated" });
+  } catch { res.status(500).send({ message: "Failed to update equipment" }); }
+});
+
+app.delete("/api/admin/equipment/:id", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (!validId(req.params.id)) return res.status(400).send({ message: "Invalid equipment id" });
+    const result = await equipmentCollection.deleteOne({ _id: toObjectId(req.params.id) });
+    if (!result.deletedCount) return res.status(404).send({ message: "Equipment not found" });
+    res.send({ message: "Equipment deleted" });
+  } catch { res.status(500).send({ message: "Failed to delete equipment" }); }
+});
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const bookings = await bookingsCollection.aggregate([
+      { $sort: { bookingDate: -1 } },
+      { $lookup: { from: "user", localField: "customerId", foreignField: "_id", as: "customer" } },
+      { $lookup: { from: "user", localField: "ownerId", foreignField: "_id", as: "owner" } },
+      { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
+      { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$owner", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$equipment", preserveNullAndEmptyArrays: true } },
+      { $project: { equipmentId: 1, equipmentTitle: { $ifNull: ["$equipment.title", "$equipmentTitle"] }, equipmentImage: "$equipment.image", startDate: 1, endDate: 1, bookingDate: 1, quantity: 1, totalAmount: 1, paymentStatus: 1, transactionId: 1, bookingStatus: 1, customerName: { $ifNull: ["$customer.name", "$customerName"] }, customerEmail: "$customer.email", ownerName: { $ifNull: ["$owner.name", ""] }, ownerEmail: "$owner.email" } }
+    ]).toArray();
+    res.send({ bookings });
+  } catch { res.status(500).send({ message: "Failed to load bookings" }); }
+});
+
 
 app.use((req, res) => res.status(404).send({ message: "Route not found" }));
 app.use((error, req, res, next) => {
