@@ -46,6 +46,14 @@ const verifyRenter = (req, res, next) => {
   if (req.user?.role !== "customer" && req.user?.role !== "renter") return res.status(403).send({ message: "Renter access required" });
   next();
 };
+const verifyOwner = (req, res, next) => {
+  if (req.user?.role !== "owner") return res.status(403).send({ message: "Owner access required" });
+  next();
+};
+const verifyAdmin = (req, res, next) => {
+  if (req.user?.role !== "admin") return res.status(403).send({ message: "Admin access required" });
+  next();
+};
 const validId = (id) => ObjectId.isValid(id);
 const toObjectId = (id) => new ObjectId(id);
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
