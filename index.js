@@ -63,7 +63,7 @@ app.get("/api/health", (req, res) => res.send({ status: "ok" }));
 // Public equipment list with server-side search, filtering, sorting and pagination.
 app.get("/api/equipment", async (req, res) => {
   try {
-    const { search, category, rentalType, availability, minPrice, maxPrice } = req.query;
+    const { search, category, rentalType, availability, minPrice, maxPrice, sort = "recent", page = "1", limit = "12" } = req.query;
     const query = { status: "approved" };
     if (category) query.category = category;
     if (rentalType) query.rentalType = rentalType;
@@ -79,11 +79,14 @@ app.get("/api/equipment", async (req, res) => {
       const safeSearch = new RegExp(escapeRegex(String(search)), "i");
       query.$or = [{ title: safeSearch }, { category: safeSearch }, { location: safeSearch }];
     }
+    const pageNumber = Math.max(1, Number(page) || 1);
+    const pageSize = Math.min(30, Math.max(1, Number(limit) || 12));
+    const sortOptions = sort === "price_asc" ? { price: 1 } : sort === "price_desc" ? { price: -1 } : { createdAt: -1 };
     const [equipment, total] = await Promise.all([
-      equipmentCollection.find(query).toArray(),
+      equipmentCollection.find(query).sort(sortOptions).skip((pageNumber - 1) * pageSize).limit(pageSize).toArray(),
       equipmentCollection.countDocuments(query)
     ]);
-    res.send({ equipment, total });
+    res.send({ equipment, total, page: pageNumber, totalPages: Math.ceil(total / pageSize) });
   } catch (error) {
     res.status(500).send({ message: "Failed to load equipment" });
   }
