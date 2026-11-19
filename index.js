@@ -42,6 +42,10 @@ function verifyToken(req, res, next) {
     return res.status(401).send({ message: "Invalid or expired token" });
   }
 }
+const verifyRenter = (req, res, next) => {
+  if (req.user?.role !== "customer" && req.user?.role !== "renter") return res.status(403).send({ message: "Renter access required" });
+  next();
+};
 const validId = (id) => ObjectId.isValid(id);
 const toObjectId = (id) => new ObjectId(id);
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
