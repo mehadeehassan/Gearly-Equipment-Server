@@ -15,8 +15,15 @@ Standalone Express API for the Gearly equipment rental marketplace. Uses the Mon
 - `MONGODB_URI`, `DB_NAME`: MongoDB connection and database.
 - `JWT_SECRET`, `JWT_ISSUER`, `JWT_AUDIENCE`: must exactly match the Next.js client values. The client signs a short-lived HS256 service token on the server after checking the Better Auth session.
 - `STRIPE_SECRET_KEY`: a Stripe Test Mode secret or restricted key for local Checkout. Keep it server-side.
+- `CRON_SECRET`: a long random secret used by Vercel Cron to authorize booking completion. Configure it as a server-side Vercel environment variable; never add it to the frontend.
 
 Never commit `.env`.
+
+## Automatic booking completion
+
+Bookings are marked `completed` when their `endDate` is earlier than the current UTC time, their `paymentStatus` is `paid`, and their `bookingStatus` is `confirmed`, `active`, or `ongoing`. The update query only matches those eligible states, so rerunning it leaves unpaid, pending-payment, cancelled, rejected, and already completed bookings unchanged.
+
+For local development or a persistent Node.js server, `node-cron` runs the update once each hour at minute 0 in UTC. On Vercel, the in-process schedule is disabled; `vercel.json` invokes the protected `GET /api/cron/complete-bookings` endpoint daily at 00:00 UTC, which is compatible with Hobby plan scheduling. If the Vercel project is on Pro or Enterprise and hourly updates are preferred, change the schedule to `0 * * * *`. Set `CRON_SECRET` in the Vercel project environment before enabling the deployment cron. Vercel sends `Authorization: Bearer <CRON_SECRET>`; requests without the matching header are rejected.
 
 ## API features
 

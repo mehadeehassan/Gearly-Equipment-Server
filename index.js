@@ -3,6 +3,7 @@ import 'dotenv/config';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { MongoClient, ObjectId } from 'mongodb';
+import cron from 'node-cron';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Stripe from 'stripe';
@@ -493,9 +494,9 @@ export async function connectToMongoDB() {
     await client.connect();
     console.log('You successfully connected to MongoDB!');
     return client;
-  } catch (err) {
-    console.dir(err);
-    throw err;
+  } catch {
+    console.error('Unable to connect to MongoDB.');
+    throw new Error('Unable to connect to MongoDB.');
   }
 }
 
@@ -510,6 +511,53 @@ let usersCollection,
   paymentsCollection,
   reviewsCollection;
 
+let databaseInitialization;
+async function initializeDatabase() {
+  if (!databaseInitialization) {
+    databaseInitialization = (async () => {
+      await connectToMongoDB();
+      const db = client.db(process.env.DB_NAME || 'equipment_rental');
+      usersCollection = db.collection('user');
+      equipmentCollection = db.collection('equipment');
+      bookingsCollection = db.collection('bookings');
+      favoritesCollection = db.collection('favorites');
+      paymentsCollection = db.collection('payments');
+      reviewsCollection = db.collection('reviews');
+      await Promise.all([
+        favoritesCollection.createIndex({ userId: 1, equipmentId: 1 }, { unique: true }),
+        bookingsCollection.createIndex({ customerId: 1, bookingDate: -1 }),
+        bookingsCollection.createIndex({ ownerId: 1, bookingDate: -1 }),
+        equipmentCollection.createIndex({ status: 1, category: 1, createdAt: -1 }),
+        paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
+        paymentsCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true }),
+        reviewsCollection.createIndex(
+          { bookingId: 1 },
+          { unique: true, partialFilterExpression: { bookingId: { $exists: true } } },
+        ),
+      ]);
+    })();
+  }
+  try {
+    await databaseInitialization;
+  } catch (error) {
+    databaseInitialization = null;
+    throw error;
+  }
+}
+
+async function completeExpiredBookings() {
+  const result = await bookingsCollection.updateMany(
+    {
+      endDate: { $lt: new Date() },
+      paymentStatus: 'paid',
+      bookingStatus: { $in: ['confirmed', 'active', 'ongoing'] },
+    },
+    { $set: { bookingStatus: 'completed' } },
+  );
+  console.log(`Automated booking status update completed: ${result.modifiedCount} booking(s) updated (UTC).`);
+  return result.modifiedCount;
+}
+
 function myLogger(req, res, next) {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
@@ -517,6 +565,38 @@ function myLogger(req, res, next) {
 app.use(myLogger);
 
 app.use(express.json({ limit: '2mb' }));
+
+if (process.env.VERCEL === '1') {
+  app.use(async (req, res, next) => {
+    if (req.path === '/api/cron/complete-bookings') return next();
+    try {
+      await initializeDatabase();
+      next();
+    } catch {
+      res.status(503).send({ message: 'Service temporarily unavailable' });
+    }
+  });
+}
+
+app.get('/api/cron/complete-bookings', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return res.status(503).send({ message: 'Scheduled task is not configured' });
+  if (req.headers.authorization !== `Bearer ${secret}`)
+    return res.status(401).send({ message: 'Unauthorized' });
+  if (process.env.VERCEL === '1') {
+    try {
+      await initializeDatabase();
+    } catch {
+      return res.status(503).send({ message: 'Service temporarily unavailable' });
+    }
+  }
+  try {
+    const updated = await completeExpiredBookings();
+    return res.send({ updated });
+  } catch {
+    return res.status(500).send({ message: 'Unable to update completed bookings' });
+  }
+});
 
 function verifyToken(req, res, next) {
   const authorization = req.headers.authorization;
@@ -1427,34 +1507,34 @@ app.use((error, req, res, next) => {
 
 async function startServer() {
   try {
-    await connectToMongoDB();
-    const db = client.db(process.env.DB_NAME || 'equipment_rental');
-    usersCollection = db.collection('user');
-    equipmentCollection = db.collection('equipment');
-    bookingsCollection = db.collection('bookings');
-    favoritesCollection = db.collection('favorites');
-    paymentsCollection = db.collection('payments');
-    reviewsCollection = db.collection('reviews');
-    await Promise.all([
-      favoritesCollection.createIndex({ userId: 1, equipmentId: 1 }, { unique: true }),
-      bookingsCollection.createIndex({ customerId: 1, bookingDate: -1 }),
-      bookingsCollection.createIndex({ ownerId: 1, bookingDate: -1 }),
-      equipmentCollection.createIndex({ status: 1, category: 1, createdAt: -1 }),
-      paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
-      paymentsCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true }),
-      reviewsCollection.createIndex(
-        { bookingId: 1 },
-        { unique: true, partialFilterExpression: { bookingId: { $exists: true } } },
-      ),
-    ]);
+    await initializeDatabase();
+    if (process.env.VERCEL !== '1') {
+      cron.schedule(
+        '0 * * * *',
+        async () => {
+          try {
+            await completeExpiredBookings();
+          } catch {
+            console.error('Automated booking status update failed.');
+          }
+        },
+        { timezone: 'UTC' },
+      );
+      console.log('Local hourly booking status schedule enabled (UTC).');
+    }
     app.listen(port, () => console.log(`Gearly API listening on port ${port}`));
-  } catch (error) {
-    console.error('Failed to connect to MongoDB', error);
+  } catch {
+    console.error('Failed to initialize the backend database.');
     process.exit(1);
   }
 }
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (
+  process.env.VERCEL !== '1' &&
+  process.argv[1] &&
+  fileURLToPath(import.meta.url) === process.argv[1]
+) {
   startServer();
 }
 
 export { app };
+export default app;
