@@ -548,6 +548,7 @@ async function initializeDatabase() {
         favoritesCollection.createIndex({ userId: 1, equipmentId: 1 }, { unique: true }),
         bookingsCollection.createIndex({ customerId: 1, bookingDate: -1 }),
         bookingsCollection.createIndex({ ownerId: 1, bookingDate: -1 }),
+        bookingsCollection.createIndex({ equipmentId: 1, startDate: 1, endDate: 1, bookingStatus: 1 }),
         equipmentCollection.createIndex({ status: 1, category: 1, createdAt: -1 }),
         paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }),
         paymentsCollection.createIndex({ transactionId: 1 }, { unique: true, sparse: true }),
@@ -847,6 +848,45 @@ app.get('/api/equipment/:id', async (req, res) => {
   }
 });
 
+// GET /api/equipment/:id/availability - নির্ধারিত তারিখে Equipment-এর প্রাপ্যতা দেখায়।
+app.get('/api/equipment/:id/availability', verifyToken, verifyRenter, async (req, res) => {
+  const start = new Date(String(req.query.startDate || ''));
+  const end = new Date(String(req.query.endDate || ''));
+  const quantity = Number(req.query.quantity);
+  const now = new Date();
+  if (
+    !validId(req.params.id) ||
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    start < new Date(now.toDateString()) ||
+    end <= start ||
+    !Number.isInteger(quantity) ||
+    quantity < 1
+  ) {
+    return res.status(400).send({ message: 'Please choose valid rental dates and quantity.' });
+  }
+
+  try {
+    const equipment = await equipmentCollection.findOne(
+      { _id: toObjectId(req.params.id), status: 'approved' },
+      { projection: { availableQuantity: 1 } },
+    );
+    if (!equipment) return res.status(404).send({ message: 'Equipment not found' });
+    const remainingQuantity = await getRemainingEquipmentQuantity(
+      equipment._id,
+      start,
+      end,
+      equipment.availableQuantity,
+    );
+    return res.send({
+      available: remainingQuantity >= quantity,
+      remainingQuantity: Math.max(0, remainingQuantity),
+    });
+  } catch {
+    return res.status(500).send({ message: 'Unable to check date availability' });
+  }
+});
+
 // Profile API: পরিচয় JWT থেকে নেওয়া হয়।
 // GET /api/profile - লগইন করা ব্যবহারকারীর Profile দেখায়।
 app.get('/api/profile', verifyToken, async (req, res) => {
@@ -1056,6 +1096,25 @@ app.delete('/api/favorites/:equipmentId', verifyToken, verifyRenter, async (req,
 
 // Booking API: তারিখ, মজুত ও সার্ভারে ভাড়া যাচাই করে।
 // POST /api/bookings - নতুন Booking তৈরি করে।
+async function getRemainingEquipmentQuantity(equipmentId, start, end, availableQuantity) {
+  const overlappingBookings = await bookingsCollection
+    .find(
+      {
+        equipmentId,
+        bookingStatus: { $nin: ['cancelled', 'rejected'] },
+        startDate: { $lt: end },
+        endDate: { $gt: start },
+      },
+      { projection: { quantity: 1 } },
+    )
+    .toArray();
+  const reservedQuantity = overlappingBookings.reduce(
+    (total, booking) => total + Number(booking.quantity || 0),
+    0,
+  );
+  return Number(availableQuantity || 0) - reservedQuantity;
+}
+
 app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
   const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } =
     req.body;
@@ -1082,23 +1141,13 @@ app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
       status: 'approved',
     });
     if (!equipment) return res.status(404).send({ message: 'Equipment not found' });
-    // তারিখে overlap করা Booking-এর quantity যোগ করে মজুত যাচাই হয়।
-    const overlappingBookings = await bookingsCollection
-      .find(
-        {
-          equipmentId: equipment._id,
-          bookingStatus: { $nin: ['cancelled', 'rejected'] },
-          startDate: { $lt: end },
-          endDate: { $gt: start },
-        },
-        { projection: { quantity: 1 } },
-      )
-      .toArray();
-    const reservedQuantity = overlappingBookings.reduce(
-      (total, booking) => total + Number(booking.quantity || 0),
-      0,
+    // Availability check এবং final booking validation একই overlap ও quantity logic ব্যবহার করে।
+    const remainingQuantity = await getRemainingEquipmentQuantity(
+      equipment._id,
+      start,
+      end,
+      equipment.availableQuantity,
     );
-    const remainingQuantity = Number(equipment.availableQuantity || 0) - reservedQuantity;
     if (remainingQuantity < requestedQuantity)
       return res.status(409).send({
         message: `Only ${Math.max(0, remainingQuantity)} item(s) are available for these dates`,
