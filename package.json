@@ -6,8 +6,6 @@
   "scripts": {
     "dev": "node --watch index.js",
     "start": "node index.js",
-    "seed:demo-reviews": "node scripts/seed-demo-reviews.js",
-    "seed:test-equipment": "node scripts/seed-test-equipment.js",
     "test": "node --test"
   },
   "dependencies": {

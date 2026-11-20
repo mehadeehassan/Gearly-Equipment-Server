@@ -650,9 +650,10 @@ const verifyRenter = (req, res, next) => {
     return res.status(403).send({ message: 'Renter access required' });
   next();
 };
-// Customer Role অনুমোদন করে।
+// Verified session role দিয়ে Customer এবং legacy Renter অনুমোদন করে।
 const verifyCustomer = (req, res, next) => {
-  if (!isRoleAllowed(req.user?.role, ['customer']))
+  const role = typeof req.user?.role === 'string' ? req.user.role.trim().toLowerCase() : '';
+  if (!isRoleAllowed(role, ['customer', 'renter']))
     return res.status(403).send({ message: 'Customer access required' });
   next();
 };
@@ -796,11 +797,13 @@ app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
 
   try {
     const customerId = toObjectId(req.user.id);
-    const customer = await usersCollection.findOne(
-      { _id: customerId },
-      { projection: { name: 1, image: 1, role: 1 } },
-    );
-    if (!customer || customer.role !== 'customer')
+    const customerProjection = { projection: { name: 1, image: 1, role: 1 } };
+    // Better Auth stores user _id as a string; older app records may use ObjectId.
+    const customer =
+      (await usersCollection.findOne({ _id: String(req.user.id) }, customerProjection)) ||
+      (await usersCollection.findOne({ _id: customerId }, customerProjection));
+    const accountRole = typeof customer?.role === 'string' ? customer.role.trim().toLowerCase() : '';
+    if (!customer || (customer.role != null && !isRoleAllowed(accountRole, ['customer', 'renter'])))
       return res.status(403).send({ message: 'Customer access required' });
 
     const booking = await bookingsCollection.findOne({
