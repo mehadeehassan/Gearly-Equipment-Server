@@ -8,12 +8,12 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import Stripe from 'stripe';
 
-// Authorization, data scope, and validation helpers. Kept here with the API.
-
+// অনুমোদিত Role-এর তালিকায় ব্যবহারকারীর Role আছে কি না যাচাই করে।
 export function isRoleAllowed(role, allowedRoles) {
   return allowedRoles.includes(role);
 }
 
+// Owner-এর Equipment অনুযায়ী নিরাপদ MongoDB filter তৈরি করে।
 export function ownedEquipmentFilter(ownerId, equipmentId) {
   return {
     ...(equipmentId ? { _id: new ObjectId(equipmentId) } : {}),
@@ -21,14 +21,17 @@ export function ownedEquipmentFilter(ownerId, equipmentId) {
   };
 }
 
+// Customer-এর Booking-গুলো খুঁজতে MongoDB filter তৈরি করে।
 export function customerBookingFilter(customerId) {
   return { customerId: new ObjectId(customerId) };
 }
 
+// Owner-এর Booking-গুলো খুঁজতে MongoDB filter তৈরি করে।
 export function ownerBookingFilter(ownerId) {
   return { ownerId: new ObjectId(ownerId) };
 }
 
+// Owner-এর নামসহ Admin Equipment তালিকার aggregation তৈরি করে।
 export function adminEquipmentPipeline() {
   return [
     { $sort: { createdAt: -1 } },
@@ -54,6 +57,7 @@ export function adminEquipmentPipeline() {
   ];
 }
 
+// Booking-এর বর্তমান অবস্থা দেখে Payment আবার শুরু করা যাবে কি না জানায়।
 export function canRetryBookingPayment(booking) {
   return Boolean(
     booking &&
@@ -62,6 +66,7 @@ export function canRetryBookingPayment(booking) {
   );
 }
 
+// Equipment update-এর অনুমোদিত field বেছে নিয়ে মান যাচাই করে।
 export function parseEquipmentUpdate(input = {}) {
   const fields = [
     'title',
@@ -131,16 +136,20 @@ export function parseEquipmentUpdate(input = {}) {
   return { update };
 }
 
+// ID-টি বৈধ MongoDB ObjectId কি না যাচাই করে।
 const isObjectId = (value) =>
   typeof value === 'string' && /^[a-f\d]{24}$/i.test(value) && ObjectId.isValid(value);
 
+// Stripe Payment Intent থেকে তার ID বের করে।
 const paymentIntentId = (paymentIntent) =>
   typeof paymentIntent === 'string' ? paymentIntent : paymentIntent?.id || null;
 
+// Stripe key Test Mode-এর কি না যাচাই করে।
 export function isTestStripeSecretKey(secretKey) {
   return typeof secretKey === 'string' && /^(sk|rk)_test_/.test(secretKey);
 }
 
+// Stripe Checkout Session যাচাই করে Booking ও Payment-এর অবস্থা হালনাগাদ করে।
 export async function verifyCheckoutSession(
   req,
   res,
@@ -191,10 +200,12 @@ export async function verifyCheckoutSession(
     customerId: new ObjectId(customerId),
     stripeSessionId: session.id,
   };
+  // Session-এর Booking কেবল সংশ্লিষ্ট Customer-এর জন্য খোঁজা হয়।
   const booking = await bookingsCollection.findOne(bookingFilter);
   if (!booking)
     return res.status(404).send({ message: 'Booking for this Checkout Session was not found' });
 
+  // Stripe-এর ক্ষুদ্রতম মুদ্রা এককে Booking-এর প্রত্যাশিত অর্থ মেলায়।
   const expectedAmount = Math.round(Number(booking.totalAmount) * 100);
   const expectedCurrency = String(booking.currency || 'bdt').toLowerCase();
   if (
@@ -234,6 +245,7 @@ export async function verifyCheckoutSession(
     return res.send({ status: 'pending', bookingId: String(booking._id) });
   }
 
+  // Stripe-এর যাচাইকৃত Session থেকেই Payment Intent ID নেওয়া হয়।
   const intentId = paymentIntentId(session.payment_intent);
   if (!intentId) {
     return res.status(409).send({ message: 'Paid Checkout Session is missing its Payment Intent' });
@@ -278,6 +290,7 @@ export async function verifyCheckoutSession(
     return res.status(409).send({ message: 'Booking changed while payment was being verified' });
   }
 
+  // একই Session একাধিকবার যাচাই হলেও Payment record একটিই রাখে।
   try {
     await paymentsCollection.updateOne(
       { stripeSessionId: session.id },
@@ -316,6 +329,7 @@ export async function verifyCheckoutSession(
   return res.send({ status: 'paid', bookingId: String(currentBooking._id) });
 }
 
+// Booking ইতিমধ্যে paid না হলে Payment ও Booking status হালনাগাদ করে।
 async function markUnpaidStatus(
   bookingFilter,
   bookingsCollection,
@@ -336,6 +350,7 @@ async function markUnpaidStatus(
   return res.send({ status: paymentStatus, bookingId: String(booking._id) });
 }
 
+// Customer-এর Booking-এর জন্য Stripe Checkout Session তৈরি করে।
 export async function startCheckoutSession(
   req,
   res,
@@ -355,6 +370,7 @@ export async function startCheckoutSession(
   }
 
   try {
+    // Customer ID ও Payment status মিলিয়ে Booking খোঁজা হয়।
     const bookingFilter = {
       _id: new ObjectId(bookingId),
       ...customerBookingFilter(customerId),
@@ -410,6 +426,7 @@ export async function startCheckoutSession(
     }
 
     const checkoutAttemptId = randomUUID();
+    // একই Booking-এর জন্য একসঙ্গে একাধিক Checkout শুরু হওয়া ঠেকায়।
     const lock = await bookingsCollection.updateOne(
       {
         ...bookingFilter,
@@ -429,6 +446,7 @@ export async function startCheckoutSession(
       if (booking.stripeSessionId && previousSession?.status === 'open') {
         await stripe.checkout.sessions.expire(booking.stripeSessionId);
       }
+      // Client পাঠানো amount নয়, Database-এর Booking amount ব্যবহার হয়।
       session = await stripe.checkout.sessions.create({
         mode: 'payment',
         line_items: [
@@ -489,6 +507,7 @@ export async function startCheckoutSession(
 const app = express();
 const port = process.env.PORT || 5000;
 const client = new MongoClient(process.env.MONGODB_URI);
+// MongoDB-তে সংযোগ করে সফল হলে Client ফেরত দেয়।
 export async function connectToMongoDB() {
   try {
     await client.connect();
@@ -502,6 +521,7 @@ export async function connectToMongoDB() {
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
+// নির্ধারিত Client origin থেকে API অনুরোধ গ্রহণের অনুমতি দেয়।
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:3000', credentials: true }));
 
 let usersCollection,
@@ -512,6 +532,7 @@ let usersCollection,
   reviewsCollection;
 
 let databaseInitialization;
+// Database সংযোগ, Collection ও প্রয়োজনীয় Index একবারে প্রস্তুত করে।
 async function initializeDatabase() {
   if (!databaseInitialization) {
     databaseInitialization = (async () => {
@@ -545,6 +566,7 @@ async function initializeDatabase() {
   }
 }
 
+// নির্ধারিত তারিখ পেরোনো paid Booking-গুলো completed করে।
 async function completeExpiredBookings() {
   const result = await bookingsCollection.updateMany(
     {
@@ -558,15 +580,18 @@ async function completeExpiredBookings() {
   return result.modifiedCount;
 }
 
+// প্রতিটি অনুরোধের সময়, method ও URL log করে।
 function myLogger(req, res, next) {
   console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
   next();
 }
 app.use(myLogger);
 
+// JSON request body সর্বোচ্চ 2 MB পর্যন্ত parse করে।
 app.use(express.json({ limit: '2mb' }));
 
 if (process.env.VERCEL === '1') {
+  // Vercel অনুরোধে Database প্রস্তুত করে; Cron route নিজে সংযোগ সামলায়।
   app.use(async (req, res, next) => {
     if (req.path === '/api/cron/complete-bookings') return next();
     try {
@@ -578,6 +603,7 @@ if (process.env.VERCEL === '1') {
   });
 }
 
+// GET /api/cron/complete-bookings - মেয়াদোত্তীর্ণ paid Booking সম্পন্ন করে।
 app.get('/api/cron/complete-bookings', async (req, res) => {
   const secret = process.env.CRON_SECRET;
   if (!secret) return res.status(503).send({ message: 'Scheduled task is not configured' });
@@ -598,6 +624,7 @@ app.get('/api/cron/complete-bookings', async (req, res) => {
   }
 });
 
+// Bearer JWT যাচাই করে ব্যবহারকারীর পরিচয় request-এ যোগ করে।
 function verifyToken(req, res, next) {
   const authorization = req.headers.authorization;
   if (!authorization || !authorization.startsWith('Bearer ')) {
@@ -616,31 +643,40 @@ function verifyToken(req, res, next) {
   }
 }
 
+// Renter বা Customer Role অনুমোদন করে।
 const verifyRenter = (req, res, next) => {
   if (!isRoleAllowed(req.user?.role, ['customer', 'renter']))
     return res.status(403).send({ message: 'Renter access required' });
   next();
 };
+// Customer Role অনুমোদন করে।
 const verifyCustomer = (req, res, next) => {
   if (!isRoleAllowed(req.user?.role, ['customer']))
     return res.status(403).send({ message: 'Customer access required' });
   next();
 };
+// Owner Role অনুমোদন করে।
 const verifyOwner = (req, res, next) => {
   if (!isRoleAllowed(req.user?.role, ['owner']))
     return res.status(403).send({ message: 'Owner access required' });
   next();
 };
+// Admin Role অনুমোদন করে।
 const verifyAdmin = (req, res, next) => {
   if (!isRoleAllowed(req.user?.role, ['admin']))
     return res.status(403).send({ message: 'Admin access required' });
   next();
 };
 
+// ID বৈধ কি না এবং ObjectId-তে রূপান্তর—দুই কাজের helper।
 const validId = (id) => ObjectId.isValid(id);
+// ID-কে MongoDB ObjectId-তে রূপান্তর করে।
 const toObjectId = (id) => new ObjectId(id);
+// Regular Expression-এ বিশেষ অর্থ থাকা অক্ষর escape করে।
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+// Payment API: Checkout Session যাচাই করে Payment status নিশ্চিত করে।
+// POST /api/payments/verify-session - Stripe Session যাচাই করে।
 app.post('/api/payments/verify-session', verifyToken, verifyRenter, (req, res) =>
   verifyCheckoutSession(req, res, {
     stripe,
@@ -650,10 +686,14 @@ app.post('/api/payments/verify-session', verifyToken, verifyRenter, (req, res) =
   }),
 );
 
+// সাধারণ API ও Health endpoint।
+// GET / - API চালু আছে কি না জানায়।
 app.get('/', (req, res) => res.send({ message: 'Gearly API is running' }));
+// GET /api/health - API-এর Health status জানায়।
 app.get('/api/health', (req, res) => res.send({ status: 'ok' }));
 
-// Public equipment list with server-side search, filtering, sorting and pagination.
+// Public Equipment API।
+// GET /api/equipment - Search, filter, sort ও pagination অনুযায়ী Equipment দেখায়।
 app.get('/api/equipment', async (req, res) => {
   try {
     const {
@@ -707,6 +747,7 @@ app.get('/api/equipment', async (req, res) => {
   }
 });
 
+// GET /api/equipment/featured - সাম্প্রতিক ছয়টি অনুমোদিত Equipment দেখায়।
 app.get('/api/equipment/featured', async (req, res) => {
   try {
     const equipment = await equipmentCollection
@@ -720,7 +761,8 @@ app.get('/api/equipment/featured', async (req, res) => {
   }
 });
 
-// Public reviews only include submissions linked to a booking.
+// Review API: Booking সম্পন্ন হওয়ার পরের Review দেখায় ও জমা নেয়।
+// GET /api/reviews - Booking-সংশ্লিষ্ট অনুমোদিত Review দেখায়।
 app.get('/api/reviews', async (req, res) => {
   try {
     const reviews = await reviewsCollection
@@ -737,6 +779,7 @@ app.get('/api/reviews', async (req, res) => {
   }
 });
 
+// POST /api/reviews - সম্পন্ন paid Booking-এর Review জমা নেয়।
 app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
   const fieldErrors = {};
   const bookingId = validId(req.body?.bookingId) ? toObjectId(req.body.bookingId) : null;
@@ -789,6 +832,7 @@ app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
   }
 });
 
+// GET /api/equipment/:id - একটি অনুমোদিত Equipment-এর বিস্তারিত দেখায়।
 app.get('/api/equipment/:id', async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -803,7 +847,8 @@ app.get('/api/equipment/:id', async (req, res) => {
   }
 });
 
-// Profile is based on the verified token identity, never on a client-supplied user id.
+// Profile API: পরিচয় JWT থেকে নেওয়া হয়।
+// GET /api/profile - লগইন করা ব্যবহারকারীর Profile দেখায়।
 app.get('/api/profile', verifyToken, async (req, res) => {
   try {
     const user = await usersCollection.findOne(
@@ -818,6 +863,7 @@ app.get('/api/profile', verifyToken, async (req, res) => {
   }
 });
 
+// PATCH /api/profile - লগইন করা ব্যবহারকারীর Profile হালনাগাদ করে।
 app.patch('/api/profile', verifyToken, async (req, res) => {
   try {
     const { name, image, phone, address } = req.body || {};
@@ -850,7 +896,8 @@ app.patch('/api/profile', verifyToken, async (req, res) => {
   }
 });
 
-// Owner equipment management.
+// Owner Equipment API।
+// POST /api/owner/equipment - নতুন Equipment অনুমোদনের জন্য জমা দেয়।
 app.post('/api/owner/equipment', verifyToken, verifyOwner, async (req, res) => {
   try {
     const parsed = parseEquipmentUpdate(req.body);
@@ -885,6 +932,7 @@ app.post('/api/owner/equipment', verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
+// GET /api/owner/equipment - Owner-এর সব Equipment দেখায়।
 app.get('/api/owner/equipment', verifyToken, verifyOwner, async (req, res) => {
   try {
     const equipment = await equipmentCollection
@@ -897,6 +945,7 @@ app.get('/api/owner/equipment', verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
+// GET /api/owner/equipment/:id - Owner-এর একটি Equipment দেখায়।
 app.get('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -910,6 +959,7 @@ app.get('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res) =
   }
 });
 
+// PATCH /api/owner/equipment/:id - Owner-এর Equipment বদলে পুনরায় review-তে পাঠায়।
 app.patch('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -926,6 +976,7 @@ app.patch('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res)
   }
 });
 
+// DELETE /api/owner/equipment/:id - Owner-এর Equipment মুছে দেয়।
 app.delete('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -939,7 +990,8 @@ app.delete('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res
   }
 });
 
-// Favorites.
+// Favorites API: ব্যবহারকারীর পছন্দের Equipment পরিচালনা করে।
+// GET /api/favorites - পছন্দের Equipment তালিকা দেখায়।
 app.get('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
   try {
     const favorites = await favoritesCollection
@@ -961,6 +1013,7 @@ app.get('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
     res.status(500).send({ message: 'Failed to load favorites' });
   }
 });
+// POST /api/favorites/:equipmentId - Equipment-টি Favorites-এ যোগ করে।
 app.post('/api/favorites/:equipmentId', verifyToken, verifyRenter, async (req, res) => {
   try {
     if (!validId(req.params.equipmentId))
@@ -986,6 +1039,7 @@ app.post('/api/favorites/:equipmentId', verifyToken, verifyRenter, async (req, r
     res.status(500).send({ message: 'Failed to add favorite' });
   }
 });
+// DELETE /api/favorites/:equipmentId - Equipment-টি Favorites থেকে সরায়।
 app.delete('/api/favorites/:equipmentId', verifyToken, verifyRenter, async (req, res) => {
   try {
     if (!validId(req.params.equipmentId))
@@ -1000,7 +1054,8 @@ app.delete('/api/favorites/:equipmentId', verifyToken, verifyRenter, async (req,
   }
 });
 
-// Booking creation checks dates, quantities and calculates the amount on the server.
+// Booking API: তারিখ, মজুত ও সার্ভারে ভাড়া যাচাই করে।
+// POST /api/bookings - নতুন Booking তৈরি করে।
 app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
   const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } =
     req.body;
@@ -1027,6 +1082,7 @@ app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
       status: 'approved',
     });
     if (!equipment) return res.status(404).send({ message: 'Equipment not found' });
+    // তারিখে overlap করা Booking-এর quantity যোগ করে মজুত যাচাই হয়।
     const overlappingBookings = await bookingsCollection
       .find(
         {
@@ -1081,6 +1137,7 @@ app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
   }
 });
 
+// GET /api/bookings/my - লগইন করা Customer-এর Booking ও Review অবস্থা দেখায়।
 app.get('/api/bookings/my', verifyToken, verifyRenter, async (req, res) => {
   try {
     const bookings = await bookingsCollection
@@ -1123,6 +1180,8 @@ app.get('/api/bookings/my', verifyToken, verifyRenter, async (req, res) => {
     res.status(500).send({ message: 'Failed to load bookings' });
   }
 });
+// Customer Analytics API।
+// GET /api/customer/analytics - Customer-এর Booking ও খরচের সারাংশ দেখায়।
 app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) => {
   try {
     const customerId = toObjectId(req.user.id);
@@ -1206,6 +1265,7 @@ app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) =
   }
 });
 
+// GET /api/owner/bookings - Owner-এর Booking তালিকা দেখায়।
 app.get('/api/owner/bookings', verifyToken, verifyOwner, async (req, res) => {
   try {
     const bookings = await bookingsCollection
@@ -1236,7 +1296,8 @@ app.get('/api/owner/bookings', verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
-// Stripe Checkout: only server-side booking amount is used.
+// Stripe Checkout API: অর্থের পরিমাণ সার্ভারের Booking থেকে নেওয়া হয়।
+// POST /api/payments/checkout/:bookingId - Booking-এর জন্য Checkout শুরু করে।
 app.post('/api/payments/checkout/:bookingId', verifyToken, verifyRenter, (req, res) =>
   startCheckoutSession(req, res, {
     stripe,
@@ -1247,7 +1308,8 @@ app.post('/api/payments/checkout/:bookingId', verifyToken, verifyRenter, (req, r
   }),
 );
 
-// Admin management.
+// Admin User ও Equipment পরিচালনা API।
+// GET /api/admin/users - সব User-এর তালিকা দেখায়।
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const users = await usersCollection
@@ -1259,6 +1321,7 @@ app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
     res.status(500).send({ message: 'Failed to load users' });
   }
 });
+// PATCH /api/admin/users/:id/role - User-এর Role বদলায়।
 app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid user id' });
@@ -1276,6 +1339,7 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res
     res.status(500).send({ message: 'Failed to update user role' });
   }
 });
+// GET /api/admin/equipment - Owner-এর নামসহ সব Equipment দেখায়।
 app.get('/api/admin/equipment', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const equipment = await equipmentCollection.aggregate(adminEquipmentPipeline()).toArray();
@@ -1284,6 +1348,7 @@ app.get('/api/admin/equipment', verifyToken, verifyAdmin, async (req, res) => {
     res.status(500).send({ message: 'Failed to load equipment' });
   }
 });
+// PATCH /api/admin/equipment/:id/status - Equipment-এর অনুমোদন অবস্থা বদলায়।
 app.patch('/api/admin/equipment/:id/status', verifyToken, verifyAdmin, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -1299,6 +1364,7 @@ app.patch('/api/admin/equipment/:id/status', verifyToken, verifyAdmin, async (re
     res.status(500).send({ message: 'Failed to update equipment status' });
   }
 });
+// PATCH /api/admin/equipment/:id - Admin-এর মাধ্যমে Equipment তথ্য বদলায়।
 app.patch('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -1315,6 +1381,7 @@ app.patch('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res)
   }
 });
 
+// DELETE /api/admin/equipment/:id - Equipment মুছে দেয়।
 app.delete('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res) => {
   try {
     if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid equipment id' });
@@ -1325,6 +1392,8 @@ app.delete('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res
     res.status(500).send({ message: 'Failed to delete equipment' });
   }
 });
+// Admin Booking ও Analytics API।
+// GET /api/admin/bookings - Customer ও Owner তথ্যসহ সব Booking দেখায়।
 app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const bookings = await bookingsCollection
@@ -1372,7 +1441,8 @@ app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// Dynamic analytics using MongoDB aggregation.
+// MongoDB aggregation দিয়ে Admin-এর সামগ্রিক Analytics তৈরি করে।
+// GET /api/admin/analytics - User, Booking ও আয়ের সারাংশ দেখায়।
 app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [
@@ -1438,6 +1508,7 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
     res.status(500).send({ message: 'Failed to calculate analytics' });
   }
 });
+// GET /api/owner/analytics - Owner-এর Equipment, Booking ও আয়ের সারাংশ দেখায়।
 app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
   try {
     const ownerId = toObjectId(req.user.id);
@@ -1499,12 +1570,15 @@ app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
   }
 });
 
+// অচেনা endpoint-এর জন্য 404 response পাঠায়।
 app.use((req, res) => res.status(404).send({ message: 'Route not found' }));
+// ত্রুটি log করে সাধারণ 500 response পাঠায়।
 app.use((error, req, res, next) => {
   console.error(error);
   res.status(500).send({ message: 'Internal server error' });
 });
 
+// Database-এ সংযোগ করে server ও স্থানীয় Cron schedule চালু করে।
 async function startServer() {
   try {
     await initializeDatabase();
