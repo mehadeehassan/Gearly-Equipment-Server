@@ -887,6 +887,54 @@ app.get('/api/equipment/:id/availability', verifyToken, verifyRenter, async (req
   }
 });
 
+// GET /api/equipment/:id/monthly-availability - নির্ধারিত মাসে Equipment-এর দৈনিক প্রাপ্যতা দেখায়।
+app.get('/api/equipment/:id/monthly-availability', verifyToken, verifyRenter, async (req, res) => {
+  const month = String(req.query.month || '');
+  if (!validId(req.params.id) || !/^\d{4}-(0[1-9]|1[0-2])$/.test(month))
+    return res.status(400).send({ message: 'A valid equipment id and month are required.' });
+
+  try {
+    const [year, monthNumber] = month.split('-').map(Number);
+    const monthStart = new Date(Date.UTC(year, monthNumber - 1, 1));
+    const monthEnd = new Date(Date.UTC(year, monthNumber, 1));
+    const equipment = await equipmentCollection.findOne(
+      { _id: toObjectId(req.params.id), status: 'approved' },
+      { projection: { availableQuantity: 1 } },
+    );
+    if (!equipment) return res.status(404).send({ message: 'Equipment not found' });
+
+    const overlappingBookings = await getOverlappingEquipmentBookings(
+      equipment._id,
+      monthStart,
+      monthEnd,
+      { quantity: 1, startDate: 1, endDate: 1 },
+    );
+    const totalQuantity = Number(equipment.availableQuantity) || 0;
+    const dayCount = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+    const days = [];
+
+    for (let day = 1; day <= dayCount; day++) {
+      const dayStart = new Date(Date.UTC(year, monthNumber - 1, day));
+      const dayEnd = new Date(Date.UTC(year, monthNumber - 1, day + 1));
+      const bookedQuantity = overlappingBookings.reduce((total, booking) => {
+        return booking.startDate < dayEnd && booking.endDate > dayStart
+          ? total + Number(booking.quantity || 0)
+          : total;
+      }, 0);
+      const date = dayStart.toISOString().slice(0, 10);
+      days.push({
+        date,
+        bookedQuantity,
+        availableQuantity: Math.max(0, totalQuantity - bookedQuantity),
+      });
+    }
+
+    return res.send({ month, totalQuantity, days });
+  } catch {
+    return res.status(500).send({ message: 'Unable to load monthly availability' });
+  }
+});
+
 // Profile API: পরিচয় JWT থেকে নেওয়া হয়।
 // GET /api/profile - লগইন করা ব্যবহারকারীর Profile দেখায়।
 app.get('/api/profile', verifyToken, async (req, res) => {
@@ -1096,8 +1144,8 @@ app.delete('/api/favorites/:equipmentId', verifyToken, verifyRenter, async (req,
 
 // Booking API: তারিখ, মজুত ও সার্ভারে ভাড়া যাচাই করে।
 // POST /api/bookings - নতুন Booking তৈরি করে।
-async function getRemainingEquipmentQuantity(equipmentId, start, end, availableQuantity) {
-  const overlappingBookings = await bookingsCollection
+async function getOverlappingEquipmentBookings(equipmentId, start, end, projection = { quantity: 1 }) {
+  return bookingsCollection
     .find(
       {
         equipmentId,
@@ -1105,9 +1153,14 @@ async function getRemainingEquipmentQuantity(equipmentId, start, end, availableQ
         startDate: { $lt: end },
         endDate: { $gt: start },
       },
-      { projection: { quantity: 1 } },
+      { projection },
     )
     .toArray();
+}
+
+// নির্ধারিত তারিখে Equipment-এর প্রাপ্যতা যাচাই করে।
+async function getRemainingEquipmentQuantity(equipmentId, start, end, availableQuantity) {
+  const overlappingBookings = await getOverlappingEquipmentBookings(equipmentId, start, end);
   const reservedQuantity = overlappingBookings.reduce(
     (total, booking) => total + Number(booking.quantity || 0),
     0,
@@ -1115,6 +1168,7 @@ async function getRemainingEquipmentQuantity(equipmentId, start, end, availableQ
   return Number(availableQuantity || 0) - reservedQuantity;
 }
 
+// POST /api/bookings - নতুন Booking তৈরি করে।
 app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
   const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } =
     req.body;
