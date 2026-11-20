@@ -34,7 +34,7 @@ export function ownerBookingFilter(ownerId) {
 // Owner-এর নামসহ Admin Equipment তালিকার aggregation তৈরি করে।
 export function adminEquipmentPipeline() {
   return [
-    { $sort: { createdAt: -1 } },
+    { $sort: { createdAt: -1, _id: -1 } },
     {
       $lookup: {
         from: 'user',
@@ -678,6 +678,30 @@ const toObjectId = (id) => new ObjectId(id);
 // Regular Expression-এ বিশেষ অর্থ থাকা অক্ষর escape করে।
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+// Pagination-এর জন্য skip, limit ও pagination তথ্য তৈরি করে।
+function getPagination(pageValue, totalRecords, limitValue) {
+  const requestedPage = Number(pageValue);
+  const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+  const requestedLimit = Number(limitValue);
+  const limit = Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+    ? Math.min(requestedLimit, 10)
+    : 10;
+  const totalPages = Math.ceil(totalRecords / limit);
+  const currentPage = totalPages ? Math.min(page, totalPages) : 1;
+  return {
+    skip: (currentPage - 1) * limit,
+    limit,
+    pagination: {
+      currentPage,
+      limit,
+      totalRecords,
+      totalPages,
+      hasNextPage: currentPage < totalPages,
+      hasPreviousPage: currentPage > 1,
+    },
+  };
+}
+
 // Payment API: Checkout Session যাচাই করে Payment status নিশ্চিত করে।
 // POST /api/payments/verify-session - Stripe Session যাচাই করে।
 app.post('/api/payments/verify-session', verifyToken, verifyRenter, (req, res) =>
@@ -872,9 +896,38 @@ async function getReviewDetails(review, includePrivateInfo = false) {
 // GET /api/admin/reviews - Admin সব Customer Review এবং সংশ্লিষ্ট তথ্য দেখেন।
 app.get('/api/admin/reviews', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const rows = await reviewsCollection.find({}).sort({ createdAt: -1 }).toArray();
+    const filter = req.query.filter === 'featured'
+      ? { isFeatured: true }
+      : req.query.filter === 'hidden'
+        ? { $or: [{ isFeatured: false }, { isFeatured: { $exists: false } }] }
+        : {};
+    const search = String(req.query.search || '').trim();
+    if (search) {
+      const pattern = new RegExp(escapeRegex(search), 'i');
+      const searchMatches = [
+        { customerName: pattern },
+        { equipmentTitle: pattern },
+        { comment: pattern },
+      ];
+      const [users, equipment] = await Promise.all([
+        usersCollection.find({ $or: [{ name: pattern }, { email: pattern }] }, { projection: { _id: 1 } }).toArray(),
+        equipmentCollection.find({ title: pattern }, { projection: { _id: 1 } }).toArray(),
+      ]);
+      const userIds = users.flatMap(({ _id }) => [_id, validId(String(_id)) ? toObjectId(String(_id)) : String(_id)]);
+      const equipmentIds = equipment.flatMap(({ _id }) => [_id, String(_id)]);
+      if (userIds.length) searchMatches.push({ customerId: { $in: userIds } });
+      if (equipmentIds.length) searchMatches.push({ equipmentId: { $in: equipmentIds } });
+      filter.$and = [{ $or: searchMatches }];
+    }
+    const totalRecords = await reviewsCollection.countDocuments(filter);
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
+    const rows = await reviewsCollection.find(filter).sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit).toArray();
     const reviews = await Promise.all(rows.map((review) => getReviewDetails(review, true)));
-    return res.send({ reviews });
+    const [allReviews, featuredReviews] = await Promise.all([
+      reviewsCollection.countDocuments({}),
+      reviewsCollection.countDocuments({ isFeatured: true }),
+    ]);
+    return res.send({ reviews, pagination, counts: { totalReviews: allReviews, featuredReviews } });
   } catch {
     return res.status(500).send({ message: 'Failed to load reviews' });
   }
@@ -917,13 +970,35 @@ app.get('/api/owner/reviews', verifyToken, verifyOwner, async (req, res) => {
       .find({ ownerId }, { projection: { _id: 1 } })
       .toArray();
     const equipmentIds = equipment.flatMap(({ _id }) => [_id, String(_id)]);
-    if (!equipmentIds.length) return res.send({ reviews: [] });
+    if (!equipmentIds.length) {
+      const { pagination } = getPagination(req.query.page, 0, req.query.limit);
+      return res.send({ reviews: [], pagination });
+    }
+    const query = { equipmentId: { $in: equipmentIds } };
+    const search = String(req.query.search || '').trim();
+    if (search) {
+      const pattern = new RegExp(escapeRegex(search), 'i');
+      const searchMatches = [{ customerName: pattern }, { equipmentTitle: pattern }, { comment: pattern }];
+      const [users, matchingEquipment] = await Promise.all([
+        usersCollection.find({ $or: [{ name: pattern }, { email: pattern }] }, { projection: { _id: 1 } }).toArray(),
+        equipmentCollection.find({ _id: { $in: equipmentIds }, title: pattern }, { projection: { _id: 1 } }).toArray(),
+      ]);
+      const userIds = users.flatMap(({ _id }) => [_id, validId(String(_id)) ? toObjectId(String(_id)) : String(_id)]);
+      const matchingEquipmentIds = matchingEquipment.flatMap(({ _id }) => [_id, String(_id)]);
+      if (userIds.length) searchMatches.push({ customerId: { $in: userIds } });
+      if (matchingEquipmentIds.length) searchMatches.push({ equipmentId: { $in: matchingEquipmentIds } });
+      query.$and = [{ $or: searchMatches }];
+    }
+    const totalRecords = await reviewsCollection.countDocuments(query);
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const rows = await reviewsCollection
-      .find({ equipmentId: { $in: equipmentIds } })
-      .sort({ createdAt: -1 })
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
       .toArray();
     const reviews = await Promise.all(rows.map((review) => getReviewDetails(review)));
-    return res.send({ reviews });
+    return res.send({ reviews, pagination });
   } catch {
     return res.status(500).send({ message: 'Failed to load equipment reviews' });
   }
@@ -1138,11 +1213,16 @@ app.post('/api/owner/equipment', verifyToken, verifyOwner, async (req, res) => {
 // GET /api/owner/equipment - Owner-এর সব Equipment দেখায়।
 app.get('/api/owner/equipment', verifyToken, verifyOwner, async (req, res) => {
   try {
+    const query = ownedEquipmentFilter(req.user.id);
+    const totalRecords = await equipmentCollection.countDocuments(query);
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const equipment = await equipmentCollection
-      .find(ownedEquipmentFilter(req.user.id))
-      .sort({ createdAt: -1 })
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
       .toArray();
-    res.send({ equipment });
+    res.send({ equipment, pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load your equipment' });
   }
@@ -1197,9 +1277,21 @@ app.delete('/api/owner/equipment/:id', verifyToken, verifyOwner, async (req, res
 // GET /api/favorites - পছন্দের Equipment তালিকা দেখায়।
 app.get('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
   try {
+    const query = { userId: toObjectId(req.user.id) };
+    const countResult = await favoritesCollection.aggregate([
+      { $match: query },
+      { $lookup: { from: 'equipment', localField: 'equipmentId', foreignField: '_id', as: 'equipment' } },
+      { $unwind: '$equipment' },
+      { $count: 'total' },
+    ]).toArray();
+    const totalRecords = countResult[0]?.total || 0;
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const favorites = await favoritesCollection
       .aggregate([
-        { $match: { userId: toObjectId(req.user.id) } },
+        { $match: query },
+        { $sort: { createdAt: -1, _id: -1 } },
+        { $skip: skip },
+        { $limit: limit },
         {
           $lookup: {
             from: 'equipment',
@@ -1211,7 +1303,7 @@ app.get('/api/favorites', verifyToken, verifyRenter, async (req, res) => {
         { $unwind: '$equipment' },
       ])
       .toArray();
-    res.send({ favorites });
+    res.send({ favorites, pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load favorites' });
   }
@@ -1358,10 +1450,15 @@ app.post('/api/bookings', verifyToken, verifyRenter, async (req, res) => {
 // GET /api/bookings/my - লগইন করা Customer-এর Booking ও Review অবস্থা দেখায়।
 app.get('/api/bookings/my', verifyToken, verifyRenter, async (req, res) => {
   try {
+    const query = customerBookingFilter(req.user.id);
+    const totalRecords = await bookingsCollection.countDocuments(query);
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const bookings = await bookingsCollection
       .aggregate([
-        { $match: customerBookingFilter(req.user.id) },
-        { $sort: { bookingDate: -1 } },
+        { $match: query },
+        { $sort: { bookingDate: -1, _id: -1 } },
+        { $skip: skip },
+        { $limit: limit },
         {
           $lookup: {
             from: 'equipment',
@@ -1393,7 +1490,7 @@ app.get('/api/bookings/my', verifyToken, verifyRenter, async (req, res) => {
             .toArray()).map((review) => String(review.bookingId)),
         )
       : new Set();
-    res.send({ bookings: bookings.map((booking) => ({ ...booking, reviewed: reviewedBookingIds.has(String(booking._id)) })) });
+    res.send({ bookings: bookings.map((booking) => ({ ...booking, reviewed: reviewedBookingIds.has(String(booking._id)) })), pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load bookings' });
   }
@@ -1403,8 +1500,10 @@ app.get('/api/bookings/my', verifyToken, verifyRenter, async (req, res) => {
 app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) => {
   try {
     const customerId = toObjectId(req.user.id);
+    const bookingQuery = customerBookingFilter(req.user.id);
+    const totalBookings = await bookingsCollection.countDocuments(bookingQuery);
+    const { skip: recentSkip, limit: recentLimit, pagination: recentBookingsPagination } = getPagination(req.query.page, totalBookings, req.query.limit);
     const [
-      totalBookings,
       activeRentals,
       completedRentals,
       pendingBookings,
@@ -1412,7 +1511,6 @@ app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) =
       monthlyRentals,
       recentBookings,
     ] = await Promise.all([
-      bookingsCollection.countDocuments(customerBookingFilter(req.user.id)),
       bookingsCollection.countDocuments({
         ...customerBookingFilter(req.user.id),
         bookingStatus: { $in: ['confirmed', 'active', 'ongoing'] },
@@ -1433,7 +1531,7 @@ app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) =
         .toArray(),
       bookingsCollection
         .aggregate([
-          { $match: customerBookingFilter(req.user.id) },
+          { $match: bookingQuery },
           {
             $group: {
               _id: { $dateToString: { format: '%Y-%m', date: '$bookingDate' } },
@@ -1447,9 +1545,10 @@ app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) =
         .toArray(),
       bookingsCollection
         .aggregate([
-          { $match: customerBookingFilter(req.user.id) },
-          { $sort: { bookingDate: -1 } },
-          { $limit: 5 },
+          { $match: bookingQuery },
+          { $sort: { bookingDate: -1, _id: -1 } },
+          { $skip: recentSkip },
+          { $limit: recentLimit },
           {
             $lookup: {
               from: 'equipment',
@@ -1477,6 +1576,7 @@ app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) =
       totalSpending: spending[0]?.total || 0,
       monthlyRentals,
       recentBookings,
+      recentBookingsPagination,
     });
   } catch {
     res.status(500).send({ message: 'Failed to calculate customer overview' });
@@ -1486,10 +1586,15 @@ app.get('/api/customer/analytics', verifyToken, verifyRenter, async (req, res) =
 // GET /api/owner/bookings - Owner-এর Booking তালিকা দেখায়।
 app.get('/api/owner/bookings', verifyToken, verifyOwner, async (req, res) => {
   try {
+    const query = ownerBookingFilter(req.user.id);
+    const totalRecords = await bookingsCollection.countDocuments(query);
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const bookings = await bookingsCollection
       .aggregate([
-        { $match: ownerBookingFilter(req.user.id) },
-        { $sort: { bookingDate: -1 } },
+        { $match: query },
+        { $sort: { bookingDate: -1, _id: -1 } },
+        { $skip: skip },
+        { $limit: limit },
         {
           $lookup: {
             from: 'equipment',
@@ -1508,7 +1613,7 @@ app.get('/api/owner/bookings', verifyToken, verifyOwner, async (req, res) => {
         { $project: { equipment: 0 } },
       ])
       .toArray();
-    res.send({ bookings });
+    res.send({ bookings, pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load owner rentals' });
   }
@@ -1530,11 +1635,15 @@ app.post('/api/payments/checkout/:bookingId', verifyToken, verifyRenter, (req, r
 // GET /api/admin/users - সব User-এর তালিকা দেখায়।
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
   try {
+    const totalRecords = await usersCollection.countDocuments({});
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const users = await usersCollection
       .find({}, { projection: { password: 0 } })
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit)
       .toArray();
-    res.send({ users });
+    res.send({ users, pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load users' });
   }
@@ -1560,8 +1669,14 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, async (req, res
 // GET /api/admin/equipment - Owner-এর নামসহ সব Equipment দেখায়।
 app.get('/api/admin/equipment', verifyToken, verifyAdmin, async (req, res) => {
   try {
-    const equipment = await equipmentCollection.aggregate(adminEquipmentPipeline()).toArray();
-    res.send({ equipment });
+    const totalRecords = await equipmentCollection.countDocuments({});
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
+    const equipment = await equipmentCollection.aggregate([
+      ...adminEquipmentPipeline(),
+      { $skip: skip },
+      { $limit: limit },
+    ]).toArray();
+    res.send({ equipment, pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load equipment' });
   }
@@ -1614,9 +1729,13 @@ app.delete('/api/admin/equipment/:id', verifyToken, verifyAdmin, async (req, res
 // GET /api/admin/bookings - Customer ও Owner তথ্যসহ সব Booking দেখায়।
 app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
   try {
+    const totalRecords = await bookingsCollection.countDocuments({});
+    const { skip, limit, pagination } = getPagination(req.query.page, totalRecords, req.query.limit);
     const bookings = await bookingsCollection
       .aggregate([
-        { $sort: { bookingDate: -1 } },
+        { $sort: { bookingDate: -1, _id: -1 } },
+        { $skip: skip },
+        { $limit: limit },
         {
           $lookup: { from: 'user', localField: 'customerId', foreignField: '_id', as: 'customer' },
         },
@@ -1653,7 +1772,7 @@ app.get('/api/admin/bookings', verifyToken, verifyAdmin, async (req, res) => {
         },
       ])
       .toArray();
-    res.send({ bookings });
+    res.send({ bookings, pagination });
   } catch {
     res.status(500).send({ message: 'Failed to load bookings' });
   }
