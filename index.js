@@ -532,6 +532,7 @@ let usersCollection,
   reviewsCollection;
 
 let databaseInitialization;
+
 // Database সংযোগ, Collection ও প্রয়োজনীয় Index একবারে প্রস্তুত করে।
 async function initializeDatabase() {
   if (!databaseInitialization) {
@@ -1784,21 +1785,31 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [
       totalUsers,
+      totalCustomers,
+      totalOwners,
       totalEquipment,
       totalBookings,
       pendingApprovals,
       completedRentals,
+      totalPayments,
       revenue,
       monthlyBookings,
       monthlyRevenue,
+      userRegistrationTrend,
+      categoryDistribution,
+      equipmentStatusDistribution,
+      bookingStatusDistribution,
       totalReviews,
       homepageReviews,
     ] = await Promise.all([
       usersCollection.countDocuments({}),
+      usersCollection.countDocuments({ role: { $in: ['customer', 'renter'] } }),
+      usersCollection.countDocuments({ role: 'owner' }),
       equipmentCollection.countDocuments({}),
       bookingsCollection.countDocuments({}),
       equipmentCollection.countDocuments({ status: 'pending' }),
       bookingsCollection.countDocuments({ bookingStatus: 'completed' }),
+      paymentsCollection.countDocuments({ status: 'paid' }),
       paymentsCollection
         .aggregate([
           { $match: { status: 'paid' } },
@@ -1832,18 +1843,56 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
           { $sort: { _id: 1 } },
         ])
         .toArray(),
+        // User Registration Trend, Category Distribution, Equipment Status Distribution, Booking Status Distribution, Total Reviews, Homepage Reviews গণনা করে।
+      usersCollection
+        .aggregate([
+          { $match: { createdAt: { $type: 'date' } } },
+          { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$createdAt' } }, total: { $sum: 1 } } },
+          { $sort: { _id: -1 } },
+          { $limit: 12 },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray(),
+        // Equipment Category Distribution, Equipment Status Distribution, Booking Status Distribution গণনা করে।
+      equipmentCollection
+        .aggregate([
+          { $group: { _id: { $ifNull: ['$category', 'Uncategorized'] }, total: { $sum: 1 } } },
+          { $sort: { total: -1, _id: 1 } },
+        ])
+        .toArray(),
+        // Equipment Status Distribution গণনা করে।
+      equipmentCollection
+        .aggregate([
+          { $group: { _id: { $ifNull: ['$status', 'unknown'] }, total: { $sum: 1 } } },
+          { $sort: { total: -1, _id: 1 } },
+        ])
+        .toArray(),
+        // Booking Status Distribution গণনা করে।
+      bookingsCollection
+        .aggregate([
+          { $group: { _id: { $ifNull: ['$bookingStatus', 'unknown'] }, total: { $sum: 1 } } },
+          { $sort: { total: -1, _id: 1 } },
+        ])
+        .toArray(),
       reviewsCollection.countDocuments({}),
       reviewsCollection.countDocuments({ status: 'approved', isFeatured: true }),
     ]);
     res.send({
       totalUsers,
+      totalCustomers,
+      totalOwners,
       totalEquipment,
       totalBookings,
       pendingApprovals,
       completedRentals,
+      totalPayments,
       totalRevenue: revenue[0]?.total || 0,
       monthlyBookings,
       monthlyRevenue,
+      userRegistrationTrend,
+      categoryDistribution,
+      equipmentStatusDistribution,
+      bookingStatusDistribution,
       totalReviews,
       homepageReviews,
     });
@@ -1855,32 +1904,51 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
 app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
   try {
     const ownerId = toObjectId(req.user.id);
+    const equipmentQuery = { ownerId };
+    const bookingsQuery = ownerBookingFilter(req.user.id);
     const ownedEquipment = await equipmentCollection
-      .find({ ownerId }, { projection: { _id: 1 } })
+      .find(equipmentQuery, { projection: { _id: 1 } })
       .toArray();
+      // Owner-এর Equipment ID গুলো সংগ্রহ করে।
     const equipmentIds = ownedEquipment.flatMap(({ _id }) => [_id, String(_id)]);
     const [
       totalEquipment,
       approvedEquipment,
       pendingEquipment,
+      rejectedEquipment,
+      availableUnits,
       totalBookings,
       activeRentals,
       completedRentals,
+      pendingBookings,
       earnings,
       monthlyEarnings,
+      monthlyOwnerBookings,
+      equipmentStatusDistribution,
+      bookingStatusDistribution,
+      mostBookedEquipment,
       myEquipmentReviews,
     ] = await Promise.all([
-      equipmentCollection.countDocuments({ ownerId }),
-      equipmentCollection.countDocuments({ ownerId, status: 'approved' }),
-      equipmentCollection.countDocuments({ ownerId, status: 'pending' }),
-      bookingsCollection.countDocuments(ownerBookingFilter(req.user.id)),
+      equipmentCollection.countDocuments(equipmentQuery),
+      equipmentCollection.countDocuments({ ...equipmentQuery, status: 'approved' }),
+      equipmentCollection.countDocuments({ ...equipmentQuery, status: 'pending' }),
+      equipmentCollection.countDocuments({ ...equipmentQuery, status: 'rejected' }),
+      equipmentCollection.aggregate([
+        { $match: equipmentQuery },
+        { $group: { _id: null, total: { $sum: { $ifNull: ['$availableQuantity', 0] } } } },
+      ]).toArray(),
+      bookingsCollection.countDocuments(bookingsQuery),
       bookingsCollection.countDocuments({
-        ...ownerBookingFilter(req.user.id),
+        ...bookingsQuery,
         bookingStatus: { $in: ['confirmed', 'active', 'ongoing'] },
       }),
       bookingsCollection.countDocuments({
-        ...ownerBookingFilter(req.user.id),
+        ...bookingsQuery,
         bookingStatus: 'completed',
+      }),
+      bookingsCollection.countDocuments({
+        ...bookingsQuery,
+        bookingStatus: { $in: ['pending', 'pending_payment', 'pending_approval'] },
       }),
       paymentsCollection
         .aggregate([
@@ -1902,17 +1970,63 @@ app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
           { $sort: { _id: 1 } },
         ])
         .toArray(),
+        // Owner-এর Equipment অনুযায়ী Booking গণনা করে।
+      bookingsCollection
+        .aggregate([
+          { $match: bookingsQuery },
+          { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$bookingDate' } }, total: { $sum: 1 } } },
+          { $sort: { _id: -1 } },
+          { $limit: 12 },
+          { $sort: { _id: 1 } },
+        ])
+        .toArray(),
+        // Owner-এর Equipment অনুযায়ী Booking Status distribution গণনা করে।
+      equipmentCollection
+        .aggregate([
+          { $match: equipmentQuery },
+          { $group: { _id: { $ifNull: ['$status', 'unknown'] }, total: { $sum: 1 } } },
+          { $sort: { total: -1, _id: 1 } },
+        ])
+        .toArray(),
+        // Owner-এর Booking Status distribution গণনা করে।
+      bookingsCollection
+        .aggregate([
+          { $match: bookingsQuery },
+          { $group: { _id: { $ifNull: ['$bookingStatus', 'unknown'] }, total: { $sum: 1 } } },
+          { $sort: { total: -1, _id: 1 } },
+        ])
+        .toArray(),
+        // Owner-এর Equipment অনুযায়ী সর্বাধিক Booking করা Equipment তালিকা তৈরি করে।
+      bookingsCollection
+        .aggregate([
+          { $match: bookingsQuery },
+          { $group: { _id: '$equipmentId', totalBookings: { $sum: 1 }, completedBookings: { $sum: { $cond: [{ $eq: ['$bookingStatus', 'completed'] }, 1, 0] } } } },
+          { $sort: { totalBookings: -1, _id: 1 } },
+          { $limit: 5 },
+          { $lookup: { from: 'equipment', localField: '_id', foreignField: '_id', as: 'equipment' } },
+          { $unwind: { path: '$equipment', preserveNullAndEmptyArrays: true } },
+          { $project: { _id: 0, equipmentId: '$_id', title: { $ifNull: ['$equipment.title', 'Equipment'] }, totalBookings: 1, completedBookings: 1 } },
+        ])
+        .toArray(),
       reviewsCollection.countDocuments({ equipmentId: { $in: equipmentIds } }),
     ]);
+    // Owner-এর Analytics সারাংশ response হিসেবে পাঠায়।
     res.send({
       totalEquipment,
       approvedEquipment,
       pendingEquipment,
+      rejectedEquipment,
+      availableUnits: availableUnits[0]?.total || 0,
       totalBookings,
       activeRentals,
       completedRentals,
+      pendingBookings,
       totalEarnings: earnings[0]?.total || 0,
       monthlyEarnings,
+      monthlyOwnerBookings,
+      equipmentStatusDistribution,
+      bookingStatusDistribution,
+      mostBookedEquipment,
       myEquipmentReviews,
     });
   } catch {
