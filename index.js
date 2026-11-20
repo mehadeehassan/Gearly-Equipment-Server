@@ -556,6 +556,7 @@ async function initializeDatabase() {
           { bookingId: 1 },
           { unique: true, partialFilterExpression: { bookingId: { $exists: true } } },
         ),
+        reviewsCollection.createIndex({ status: 1, isFeatured: 1, createdAt: -1 }),
       ]);
     })();
   }
@@ -769,7 +770,7 @@ app.get('/api/reviews', async (req, res) => {
   try {
     const reviews = await reviewsCollection
       .find(
-        { status: 'approved', bookingId: { $type: 'objectId' } },
+        { status: 'approved', isFeatured: true, bookingId: { $type: 'objectId' } },
         { projection: { customerName: 1, customerImage: 1, equipmentTitle: 1, rating: 1, comment: 1, createdAt: 1 } },
       )
       .sort({ createdAt: -1 })
@@ -797,11 +798,7 @@ app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
 
   try {
     const customerId = toObjectId(req.user.id);
-    const customerProjection = { projection: { name: 1, image: 1, role: 1 } };
-    // Better Auth stores user _id as a string; older app records may use ObjectId.
-    const customer =
-      (await usersCollection.findOne({ _id: String(req.user.id) }, customerProjection)) ||
-      (await usersCollection.findOne({ _id: customerId }, customerProjection));
+    const customer = await findReviewUser(req.user.id);
     const accountRole = typeof customer?.role === 'string' ? customer.role.trim().toLowerCase() : '';
     if (!customer || (customer.role != null && !isRoleAllowed(accountRole, ['customer', 'renter'])))
       return res.status(403).send({ message: 'Customer access required' });
@@ -825,6 +822,7 @@ app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
       rating,
       comment,
       status: 'approved',
+      isFeatured: false,
       createdAt: new Date(),
     };
     const result = await reviewsCollection.insertOne(review);
@@ -833,6 +831,120 @@ app.post('/api/reviews', verifyToken, verifyCustomer, async (req, res) => {
     if (error?.code === 11000)
       return res.status(409).send({ message: 'You have already reviewed this rental.' });
     return res.status(500).send({ message: 'Unable to submit your review. Please try again.' });
+  }
+});
+
+// User record IDs are strings in Better Auth and ObjectIds in older project records.
+async function findReviewUser(userId, includeEmail = false) {
+  const id = String(userId || '');
+  const projection = { projection: { name: 1, image: 1, role: 1, ...(includeEmail ? { email: 1 } : {}) } };
+  const user = await usersCollection.findOne({ _id: id }, projection);
+  return user || (validId(id) ? usersCollection.findOne({ _id: toObjectId(id) }, projection) : null);
+}
+
+async function getReviewDetails(review, includePrivateInfo = false) {
+  const equipmentId = review.equipmentId;
+  const equipmentIdText = String(equipmentId || '');
+  const equipment =
+    (equipmentId ? await equipmentCollection.findOne({ _id: equipmentId }) : null) ||
+    (validId(equipmentIdText) ? await equipmentCollection.findOne({ _id: toObjectId(equipmentIdText) }) : null);
+  const [customer, owner] = await Promise.all([
+    findReviewUser(review.customerId, includePrivateInfo),
+    equipment?.ownerId ? findReviewUser(equipment.ownerId, includePrivateInfo) : null,
+  ]);
+  const safeReview = { ...review };
+  delete safeReview.customerId;
+  delete safeReview.bookingId;
+  return {
+    ...safeReview,
+    _id: String(review._id),
+    equipmentId: equipment ? String(equipment._id) : equipmentIdText,
+    customerName: customer?.name || review.customerName || 'Gearly customer',
+    customerImage: customer?.image || review.customerImage || '',
+    ...(includePrivateInfo ? { customerEmail: customer?.email || '' } : {}),
+    equipmentTitle: equipment?.title || review.equipmentTitle || 'Equipment',
+    equipmentImage: equipment?.image || '',
+    ownerName: owner?.name || 'Equipment owner',
+    ...(includePrivateInfo ? { ownerEmail: owner?.email || '' } : {}),
+  };
+}
+
+// GET /api/admin/reviews - Admin সব Customer Review এবং সংশ্লিষ্ট তথ্য দেখেন।
+app.get('/api/admin/reviews', verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const rows = await reviewsCollection.find({}).sort({ createdAt: -1 }).toArray();
+    const reviews = await Promise.all(rows.map((review) => getReviewDetails(review, true)));
+    return res.send({ reviews });
+  } catch {
+    return res.status(500).send({ message: 'Failed to load reviews' });
+  }
+});
+
+// PATCH /api/admin/reviews/:id/featured - Admin Homepage review নির্বাচন করেন।
+app.patch('/api/admin/reviews/:id/featured', verifyToken, verifyAdmin, async (req, res) => {
+  if (!validId(req.params.id) || typeof req.body?.isFeatured !== 'boolean')
+    return res.status(400).send({ message: 'A valid review and homepage selection are required.' });
+  try {
+    const result = await reviewsCollection.updateOne(
+      { _id: toObjectId(req.params.id), status: 'approved' },
+      { $set: { isFeatured: req.body.isFeatured } },
+    );
+    if (!result.matchedCount)
+      return res.status(404).send({ message: 'Eligible review not found' });
+    return res.send({ message: 'Homepage selection updated', isFeatured: req.body.isFeatured });
+  } catch {
+    return res.status(500).send({ message: 'Failed to update homepage selection' });
+  }
+});
+
+// DELETE /api/admin/reviews/:id - Admin যেকোনো Review মুছে ফেলেন।
+app.delete('/api/admin/reviews/:id', verifyToken, verifyAdmin, async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid review id' });
+  try {
+    const result = await reviewsCollection.deleteOne({ _id: toObjectId(req.params.id) });
+    if (!result.deletedCount) return res.status(404).send({ message: 'Review not found' });
+    return res.send({ message: 'Review deleted' });
+  } catch {
+    return res.status(500).send({ message: 'Failed to delete review' });
+  }
+});
+
+// GET /api/owner/reviews - Owner শুধু নিজের Equipment-এর Review দেখেন।
+app.get('/api/owner/reviews', verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const ownerId = toObjectId(req.user.id);
+    const equipment = await equipmentCollection
+      .find({ ownerId }, { projection: { _id: 1 } })
+      .toArray();
+    const equipmentIds = equipment.flatMap(({ _id }) => [_id, String(_id)]);
+    if (!equipmentIds.length) return res.send({ reviews: [] });
+    const rows = await reviewsCollection
+      .find({ equipmentId: { $in: equipmentIds } })
+      .sort({ createdAt: -1 })
+      .toArray();
+    const reviews = await Promise.all(rows.map((review) => getReviewDetails(review)));
+    return res.send({ reviews });
+  } catch {
+    return res.status(500).send({ message: 'Failed to load equipment reviews' });
+  }
+});
+
+// DELETE /api/owner/reviews/:id - Owner-এর Equipment-এর Review মুছে ফেলেন।
+app.delete('/api/owner/reviews/:id', verifyToken, verifyOwner, async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).send({ message: 'Invalid review id' });
+  try {
+    const review = await reviewsCollection.findOne({ _id: toObjectId(req.params.id) });
+    if (!review) return res.status(404).send({ message: 'Review not found' });
+    const equipmentId = String(review.equipmentId || '');
+    const equipment = await equipmentCollection.findOne({
+      _id: validId(equipmentId) ? toObjectId(equipmentId) : review.equipmentId,
+      ownerId: toObjectId(req.user.id),
+    });
+    if (!equipment) return res.status(403).send({ message: 'You can only delete reviews for your equipment.' });
+    await reviewsCollection.deleteOne({ _id: review._id });
+    return res.send({ message: 'Review deleted' });
+  } catch {
+    return res.status(500).send({ message: 'Failed to delete review' });
   }
 });
 
@@ -1560,6 +1672,8 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
       revenue,
       monthlyBookings,
       monthlyRevenue,
+      totalReviews,
+      homepageReviews,
     ] = await Promise.all([
       usersCollection.countDocuments({}),
       equipmentCollection.countDocuments({}),
@@ -1599,6 +1713,8 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
           { $sort: { _id: 1 } },
         ])
         .toArray(),
+      reviewsCollection.countDocuments({}),
+      reviewsCollection.countDocuments({ status: 'approved', isFeatured: true }),
     ]);
     res.send({
       totalUsers,
@@ -1609,6 +1725,8 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
       totalRevenue: revenue[0]?.total || 0,
       monthlyBookings,
       monthlyRevenue,
+      totalReviews,
+      homepageReviews,
     });
   } catch {
     res.status(500).send({ message: 'Failed to calculate analytics' });
@@ -1618,6 +1736,10 @@ app.get('/api/admin/analytics', verifyToken, verifyAdmin, async (req, res) => {
 app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
   try {
     const ownerId = toObjectId(req.user.id);
+    const ownedEquipment = await equipmentCollection
+      .find({ ownerId }, { projection: { _id: 1 } })
+      .toArray();
+    const equipmentIds = ownedEquipment.flatMap(({ _id }) => [_id, String(_id)]);
     const [
       totalEquipment,
       approvedEquipment,
@@ -1627,6 +1749,7 @@ app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
       completedRentals,
       earnings,
       monthlyEarnings,
+      myEquipmentReviews,
     ] = await Promise.all([
       equipmentCollection.countDocuments({ ownerId }),
       equipmentCollection.countDocuments({ ownerId, status: 'approved' }),
@@ -1660,6 +1783,7 @@ app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
           { $sort: { _id: 1 } },
         ])
         .toArray(),
+      reviewsCollection.countDocuments({ equipmentId: { $in: equipmentIds } }),
     ]);
     res.send({
       totalEquipment,
@@ -1670,6 +1794,7 @@ app.get('/api/owner/analytics', verifyToken, verifyOwner, async (req, res) => {
       completedRentals,
       totalEarnings: earnings[0]?.total || 0,
       monthlyEarnings,
+      myEquipmentReviews,
     });
   } catch {
     res.status(500).send({ message: 'Failed to calculate owner analytics' });
